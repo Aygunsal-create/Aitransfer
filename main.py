@@ -73,24 +73,19 @@ def get_last_result(session_id: str) -> str:
 
 
 # -----------------------------
-# Parsing (Hour/Row Rule)
+# PARSER (Hour/Row Rule, WhatsApp-safe)
 # -----------------------------
-# Job time: 11:50 or 18.05 (normalize '.' -> ':', digits unchanged)
-JOB_TIME_RE = re.compile(r"\b([01]?\d|2[0-3])[:\.]([0-5]\d)\b")
+JOB_TIME_RE = re.compile(r"\b([01]?\d|2[0-3])[:\.]([0-5]\d)\b")  # 21:00 or 18.05
+FLIGHT_RE   = re.compile(r"\b([A-Z]{1,3}\s?\d{2,5})\b", re.IGNORECASE)
+PHONE_RE    = re.compile(r"\+?\d[\d\s\-\(\)]{7,}\d")
 
-# WhatsApp header: [21/2 06:48] Eyüp Abi BDR:
-WA_HEADER_RE = re.compile(
-    r"^\s*\[\s*\d{1,2}\/\d{1,2}\s+\d{1,2}[:\.]\d{2}\s*\]\s*[^:]{0,80}:\s*",
+# WhatsApp: [21/2 20:35] Eyüp Abi BDR:  ....  (20:35 is NOT job time)
+WA_PREFIX_RE = re.compile(
+    r"^\s*\[\s*\d{1,2}\/\d{1,2}\s+\d{1,2}[:\.]\d{2}\s*\]\s*[^:]{0,140}:\s*",
     re.UNICODE
 )
 
-# sender label: "Eyüp Abi BDR: Funda Kara"
-SENDER_RE = re.compile(r"^\s*([^:]{1,80})\s*:\s*(.+)$", re.UNICODE)
-
-FLIGHT_RE = re.compile(r"\b([A-Z]{1,3}\s?\d{2,5})\b", re.IGNORECASE)
-PHONE_RE = re.compile(r"\+?\d[\d\s\-\(\)]{7,}\d")
-
-# Remove full date phrases so "21" doesn't remain alone: "21 Şubat", "21 FEB", etc.
+# Remove full date phrases (so "21" doesn't remain alone)
 DATE_PHRASE_RE = re.compile(
     r"\b\d{1,2}\s*(Şubat|Subat|Ocak|Mart|Nisan|Mayıs|Mayis|Haziran|Temmuz|Ağustos|Agustos|Eylül|Eylul|Ekim|Kasım|Kasim|Aralık|Aralik|"
     r"JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC|"
@@ -98,7 +93,13 @@ DATE_PHRASE_RE = re.compile(
     re.IGNORECASE
 )
 
-# Address hints (we skip address lines and remove addressy chunks from passenger)
+# Lines to ignore (not passenger)
+IGNORE_LINE_RE = re.compile(
+    r"^(uçak\s*inmiş|ucak\s*inmis|air\s*transfer|logo\b.*|operasyon\b.*|"
+    r"pick\s*up\s*time.*|pick\s*up\s*from.*|drop\s*at.*|contact.*|passengers.*|pax.*)$",
+    re.IGNORECASE
+)
+
 ADDRESS_HINT_RE = re.compile(
     r"\b(mah|mahalle|cad|caddesi|cd\.?|sok|sokak|sk\.?|no[:\.]?|apt|apartman|kat|daire|"
     r"istanbul|türkiye|turkiye|beyoğlu|beyoglu|fatih|şişli|sisli|beşiktaş|besiktas|"
@@ -113,79 +114,69 @@ def normalize_time_token(token: str) -> Optional[str]:
     m = JOB_TIME_RE.search(token or "")
     if not m:
         return None
+    # ONLY normalize separator '.' -> ':'; digits unchanged
     return f"{int(m.group(1)):02d}:{m.group(2)}"
 
-def strip_phones(s: str) -> str:
-    s = PHONE_RE.sub(" ", s)
-    s = re.sub(r"\s{2,}", " ", s).strip()
-    return s
-
-def clean_line(raw_line: str) -> str:
-    """
-    CRITICAL:
-    - Remove WhatsApp header fully
-    - Remove sender only if LEFT side has letters (so "15:20" never gets damaged)
-    - Do NOT alter job times
-    """
-    l = (raw_line or "").strip()
-    if not l:
+def clean_line(raw: str) -> str:
+    s = (raw or "").strip()
+    if not s:
         return ""
 
-    # remove WhatsApp header (includes sender)
-    l = WA_HEADER_RE.sub("", l).strip()
+    # remove WhatsApp prefix (do NOT touch other times)
+    s = WA_PREFIX_RE.sub("", s).strip()
 
-    # sender cleanup ONLY if left side contains letters
-    m = SENDER_RE.match(l)
-    if m:
-        left = (m.group(1) or "").strip()
-        right = (m.group(2) or "").strip()
+    # remove phones
+    s = PHONE_RE.sub(" ", s)
 
-        # If left has at least 2 letters, it's a sender label -> drop it.
-        # If left is numeric/time-like (e.g. "15"), DO NOT TOUCH.
-        if re.search(r"[A-Za-zÇĞİÖŞÜçğıöşü]{2,}", left) and not JOB_TIME_RE.search(left):
-            l = right
+    # remove date phrases (21 Şubat, 21 FEB etc.)
+    s = DATE_PHRASE_RE.sub(" ", s)
 
-    l = strip_phones(l)
-    l = DATE_PHRASE_RE.sub(" ", l)
-    l = re.sub(r"\s{2,}", " ", l).strip()
-    return l
+    s = re.sub(r"\s{2,}", " ", s).strip()
+
+    # remove numbered passenger prefix: "1. NAME" / "2) NAME"
+    s = re.sub(r"^\s*\d+\s*[\.\)\-]\s*", "", s).strip()
+
+    # drop ignore lines
+    if IGNORE_LINE_RE.fullmatch(s):
+        return ""
+
+    # drop address-y long lines (unless they have a job time)
+    if ADDRESS_HINT_RE.search(s) and len(s) > 30 and not JOB_TIME_RE.search(s):
+        return ""
+
+    return s
 
 def clean_passenger(text: str) -> str:
-    t = strip_phones(text or "")
+    t = (text or "").strip()
+    t = PHONE_RE.sub(" ", t)
     t = DATE_PHRASE_RE.sub(" ", t)
-    t = re.sub(r"\s{2,}", " ", t).strip()
-
-    # drop address-y long chunks
-    if ADDRESS_HINT_RE.search(t) and len(t) > 25:
-        # keep only first piece before comma, often name is first
-        t2 = t.split(",")[0].strip()
-        if not (ADDRESS_HINT_RE.search(t2) and len(t2) > 20):
-            t = t2
-        else:
-            t = ""
-
     t = re.sub(r"\s{2,}", " ", t).strip(' "\t')
+
+    # if address-y chunk, keep only first comma part
+    if ADDRESS_HINT_RE.search(t) and len(t) > 25:
+        t2 = t.split(",")[0].strip()
+        if ADDRESS_HINT_RE.search(t2) and len(t2) > 20:
+            return ""
+        t = t2
+
     return t
 
-def parse_records_hour_row(raw: str) -> List[Dict[str, str]]:
+def parse_hour_row(raw: str) -> List[Dict[str, str]]:
     """
-    HARD RULE:
-    Each job-time occurrence => one output row.
-    We collect content since previous time as passenger text.
-    Flight is last flight seen in that block.
+    Hour/Row: each JOB_TIME occurrence produces EXACTLY 1 row.
+    Between times we collect passenger text; flight is last flight seen before that time.
     """
     rows: List[Dict[str, str]] = []
-
-    block_parts: List[str] = []
+    block: List[str] = []
     last_flight: Optional[str] = None
 
     def flush(job_time: str):
-        nonlocal block_parts, last_flight
-        passenger_raw = " ".join(block_parts).strip()
+        nonlocal block, last_flight
+        passenger_raw = " ".join(block).strip()
         passenger = clean_passenger(passenger_raw) or "?"
         flight = (last_flight or "?").replace(" ", "").upper()
         rows.append({"saat": job_time, "ucus": flight, "yolcu": passenger})
-        block_parts = []
+        block = []
         last_flight = None
 
     for raw_line in (raw or "").splitlines():
@@ -193,43 +184,38 @@ def parse_records_hour_row(raw: str) -> List[Dict[str, str]]:
         if not line:
             continue
 
-        # Ignore address-only lines if they don't contain a job time
-        if ADDRESS_HINT_RE.search(line) and len(line) > 25 and not JOB_TIME_RE.search(line):
-            continue
-
-        # detect flight (store for this block)
+        # capture flight if present
         fm = FLIGHT_RE.search(line)
         if fm:
             last_flight = fm.group(1)
 
-        # detect job time => output row immediately
+        # if job time present -> create a row NOW
         tm = JOB_TIME_RE.search(line)
         if tm:
-            job_time = normalize_time_token(tm.group(0))
-            # remove time token from remainder, and also remove flight token from remainder
+            jt = normalize_time_token(tm.group(0))
             rest = JOB_TIME_RE.sub(" ", line).strip()
             if fm:
                 rest = re.sub(re.escape(fm.group(1)), " ", rest, flags=re.IGNORECASE).strip()
             if rest:
-                block_parts.append(rest)
-            if job_time:
-                flush(job_time)
+                block.append(rest)
+            if jt:
+                flush(jt)
             continue
 
-        # no job time => add to passenger pool (but skip pure flight-only line)
+        # ignore pure flight-only lines in passenger
         if fm and re.sub(re.escape(fm.group(1)), "", line, flags=re.IGNORECASE).strip() == "":
             continue
 
-        block_parts.append(line)
+        block.append(line)
 
-    # Do NOT flush without a job time
+    # DO NOT flush without job time (hour/row rule)
     return rows
 
 def to_tsv(rows: List[Dict[str, str]]) -> str:
-    lines = ["Saat\t\tUçuş\tYolcu"]
+    out = ["Saat\t\tUçuş\tYolcu"]
     for r in rows:
-        lines.append(f"{r.get('saat','?')}\t\t{r.get('ucus','?')}\t{r.get('yolcu','?')}")
-    return "\n".join(lines)
+        out.append(f"{r.get('saat','?')}\t\t{r.get('ucus','?')}\t{r.get('yolcu','?')}")
+    return "\n".join(out)
 
 
 # -----------------------------
@@ -323,7 +309,7 @@ def finish(session_id: Optional[str] = Cookie(default=None)):
     sid = get_or_create_session(session_id)
     raw = get_buffer(sid)
 
-    rows = parse_records_hour_row(raw)
+    rows = parse_hour_row(raw)
     tsv = to_tsv(rows)
     set_last_result(sid, tsv)
 
