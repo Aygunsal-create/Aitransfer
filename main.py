@@ -1,15 +1,16 @@
 import os, re, json, uuid
 from datetime import datetime
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Tuple
 
 from fastapi import FastAPI, Form, Cookie
 from fastapi.responses import HTMLResponse, PlainTextResponse
 
 app = FastAPI()
+
 DB_PATH = "db.json"
 
 # -----------------------------
-# DB helpers
+# DB helpers (very simple)
 # -----------------------------
 def _load_db() -> Dict[str, Any]:
     if not os.path.exists(DB_PATH):
@@ -30,15 +31,14 @@ def get_or_create_session(session_id: str | None) -> str:
         session_id = uuid.uuid4().hex
         db["sessions"][session_id] = {
             "buffer": "",
-            "updated_at": datetime.utcnow().isoformat() + "Z",
-            "last_result_tsv": ""
+            "updated_at": datetime.utcnow().isoformat() + "Z"
         }
         _save_db(db)
     return session_id
 
 def append_to_buffer(session_id: str, text: str) -> None:
     db = _load_db()
-    s = db["sessions"].setdefault(session_id, {"buffer": "", "updated_at": "", "last_result_tsv": ""})
+    s = db["sessions"].setdefault(session_id, {"buffer": "", "updated_at": ""})
     if text:
         if s["buffer"] and not s["buffer"].endswith("\n"):
             s["buffer"] += "\n"
@@ -50,8 +50,7 @@ def set_buffer(session_id: str, text: str) -> None:
     db = _load_db()
     db["sessions"][session_id] = {
         "buffer": text or "",
-        "updated_at": datetime.utcnow().isoformat() + "Z",
-        "last_result_tsv": db.get("sessions", {}).get(session_id, {}).get("last_result_tsv", "")
+        "updated_at": datetime.utcnow().isoformat() + "Z"
     }
     _save_db(db)
 
@@ -59,248 +58,245 @@ def get_buffer(session_id: str) -> str:
     db = _load_db()
     return db.get("sessions", {}).get(session_id, {}).get("buffer", "")
 
-def set_last_result(session_id: str, tsv: str) -> None:
-    db = _load_db()
-    s = db["sessions"].setdefault(session_id, {"buffer": "", "updated_at": "", "last_result_tsv": ""})
-    s["last_result_tsv"] = tsv or ""
-    s["updated_at"] = datetime.utcnow().isoformat() + "Z"
-    _save_db(db)
-
-def get_last_result(session_id: str) -> str:
-    db = _load_db()
-    return db.get("sessions", {}).get(session_id, {}).get("last_result_tsv", "")
-
 # -----------------------------
-# Regex / cleaning
+# Parsing / Rules
 # -----------------------------
 TIME_RE = re.compile(r"\b([01]?\d|2[0-3])[:\.]([0-5]\d)\b")
-FLIGHT_RE = re.compile(r"\b([A-Z]{1,3}\s?\d{2,5}|[A-Z]\d[A-Z]?\d{3,5}|\d[A-Z]{1,2}\d{3,5})\b", re.IGNORECASE)
+FLIGHT_RE = re.compile(r"\b([A-Z]{1,3}\s?\d{2,5})\b", re.IGNORECASE)
 
-WA_PREFIX_RE = re.compile(r"^\s*\[\d{1,2}/\d{1,2}\s+\d{1,2}:\d{2}\]\s*[^:]{1,60}:\s*", re.UNICODE)
-PHONE_RE = re.compile(r"\+?\d[\d\s\-\(\)]{7,}\d")
+# WhatsApp header: [21/2 06:48] Eyüp Abi BDR: ...
+WA_HDR_RE = re.compile(r"^\s*\[\d{1,2}/\d{1,2}\s+\d{1,2}:\d{2}\]\s*[^:]{1,60}:\s*", re.UNICODE)
 
-ADDRESS_HINT_RE = re.compile(
-    r"(\bmah\b|\bmahalle\b|\bcad\b|\bcadde\b|\bcd\.\b|\bsk\b|\bsok\b|\bsokak\b|\bno\b[:\.]|\bkat\b|\bd:i?re\b|\bapt\b|\bblok\b|"
-    r"\bistanbul\b|\btürkiye\b|\bturkiye\b|\btr\b|\bpostcode\b|\bzip\b|\b\d{5}\b|"
-    r"fatih/|beyoğlu/|beşiktaş/|şişli/|arnavutköy/|cankurtaran|sirkeci|harbiye|gümüşsuyu)",
-    re.IGNORECASE | re.UNICODE
+# "Alış saat: 5:50" / "Alis saat: 05:50"
+PICKUP_LABEL_RE = re.compile(r"(alış|alis)\s*saat\s*:\s*([01]?\d|2[0-3])[:\.]([0-5]\d)", re.IGNORECASE)
+
+# "Uçak kod:" / "Ucus kod:" / "Uçuş kod:" / "Ucus numarası:"
+FLIGHT_LABEL_RE = re.compile(r"(uçak|ucak|uçuş|ucus)\s*(kod|kodu|no|numarası|numarasi)\s*:\s*([A-Z]{1,3}\s?\d{2,5})", re.IGNORECASE)
+
+# Address-like / location junk
+ADDR_HINT_RE = re.compile(
+    r"(mah(alle)?|cad(de)?|sk(\.|ak)?|no\s*:|sokak|street|st\.|avenue|ave\.|blvd|"
+    r"fatih/|beyoğlu/|şişli/|beşiktaş/|arnavutköy/|istanbul|türkiye|turkiye|"
+    r"\b\d{5}\b|\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b)",
+    re.IGNORECASE
 )
-
-NOISE_LINE_RE = re.compile(r"\b(uçak inmiş|ucak inmis|landed|arrived|inmiş|inmis)\b", re.IGNORECASE)
-
-# "Alış saat:" yakalama (TR + farklı yazımlar)
-PICKUP_TIME_RE = re.compile(r"\b(alış\s*saat|alis\s*saat)\s*:\s*([01]?\d|2[0-3])[:\.]([0-5]\d)\b", re.IGNORECASE | re.UNICODE)
-FLIGHT_LINE_RE = re.compile(r"\b(uçak\s*kod|ucak\s*kod)\s*:\s*([A-Z]{1,3}\s?\d{2,5})\b", re.IGNORECASE | re.UNICODE)
-NAME_LINE_RE = re.compile(r"\b(isim\s*listesi|i̇sim\s*listesi|isim\s*list|i̇si̇m\s*li̇stesi|i̇si̇m\s*li̇stesi)\s*:\s*(.+)$", re.IGNORECASE | re.UNICODE)
 
 def normalize_time(hh: str, mm: str) -> str:
     return f"{int(hh):02d}:{int(mm):02d}"
 
+def strip_phones(s: str) -> str:
+    # +90 5xx xxx xx xx / 05xx... / 10+ digits etc.
+    s = re.sub(r"\+?\d[\d\s\-\(\)]{7,}\d", "", s)
+    s = re.sub(r"\s{2,}", " ", s).strip()
+    return s
+
 def fix_mojibake(s: str) -> str:
+    """
+    WhatsApp kopyasında bazen 'Ã¼' gibi bozuk Türkçe çıkar.
+    Basit düzeltme denemesi: UTF-8 bytes -> Latin-1 decode edilmesi gibi durumları toparlar.
+    Güvenli: olmazsa aynı döner.
+    """
     if not s:
         return s
-    if not any(x in s for x in ("Ã", "Â", "Å", "Ä", "Ð", "Þ", "Ý", "�")):
-        return s
     try:
-        candidate = s.encode("latin1", errors="strict").decode("utf-8", errors="strict")
-        if candidate.count("�") <= s.count("�"):
-            return candidate
+        if "Ã" in s or "Å" in s or "Ä" in s:
+            return s.encode("latin-1", errors="ignore").decode("utf-8", errors="ignore")
     except Exception:
         pass
     return s
 
 def clean_line(line: str) -> str:
     line = fix_mojibake(line)
-    line = WA_PREFIX_RE.sub("", line)
-    line = line.replace("\u200e", "").replace("\u200f", "")
+
+    # WhatsApp imzası / header temizle
+    line = WA_HDR_RE.sub("", line).strip()
+
+    # "21 Şubat" gibi tek başına tarih satırlarını at
+    if re.fullmatch(
+        r"\d{1,2}\s*(şubat|subat|ocak|mart|nisan|mayıs|mayis|haziran|temmuz|ağustos|agustos|"
+        r"eylül|eylul|ekim|kasım|kasim|aralık|aralik)\s*\d{0,4}",
+        line,
+        flags=re.I
+    ):
+        return ""
+
+    # "Yarın için", "Uçak inmiş" gibi bilgi satırlarını at
+    if re.search(r"\b(uçak inmiş|yarın için|bugün|today|tomorrow)\b", line, flags=re.I):
+        return ""
+
+    # Adres satırı gibi görünüyorsa komple at
+    if ADDR_HINT_RE.search(line):
+        return ""
+
     return line.strip()
 
-def strip_phones(s: str) -> str:
-    s = PHONE_RE.sub("", s)
-    s = re.sub(r"\s{2,}", " ", s).strip()
-    return s
+def should_drop_saw(line: str) -> bool:
+    return "SAW" in line.upper()
 
-def remove_quotes_noise(s: str) -> str:
-    s = s.replace('"', " ").replace("“", " ").replace("”", " ")
-    s = s.replace("：", ":")  # full-width colon
-    s = re.sub(r"\s*\.\s*", " ", s)
-    s = re.sub(r"\s{2,}", " ", s).strip()
-    return s
-
-def should_drop_saw(text: str) -> bool:
-    return "SAW" in (text or "").upper()
-
-def is_address_line(line: str) -> bool:
-    if ADDRESS_HINT_RE.search(line):
-        digits = sum(ch.isdigit() for ch in line)
-        letters = sum(ch.isalpha() for ch in line)
-        if digits >= 6 or (digits >= 3 and letters >= 10):
-            return True
-    return False
-
-# -----------------------------
-# Mode 1: "Alış saat:" blokları (bu varsa bunu kullan!)
-# -----------------------------
-def parse_pickup_style(raw: str, drop_saw: bool) -> List[Dict[str, str]]:
-    lines = [clean_line(x) for x in (raw or "").splitlines()]
-    # filtre
-    filtered: List[str] = []
-    for ln in lines:
-        if not ln:
-            continue
-        if NOISE_LINE_RE.search(ln):
-            continue
-        if drop_saw and should_drop_saw(ln):
-            continue
-        if is_address_line(ln):
-            continue
-        filtered.append(fix_mojibake(ln))
-
+def extract_rows_from_text(raw: str, drop_saw: bool) -> List[Dict[str, str]]:
+    """
+    Yeni mantık:
+    - Satırları temizle (WhatsApp header, tarih, adres, bozuk TR karakter)
+    - 'Alış saat:' varsa onu JOB saati kabul et
+    - Yoksa satır tek başına saat ise JOB saati kabul et
+    - Uçuş kodunu mümkünse 'Uçak kod:' etiketinden, yoksa genel FLIGHT_RE'den al
+    - Uçuş içindeki 23:15-05:50 gibi saatler JOB saati yapılmaz
+    """
     rows: List[Dict[str, str]] = []
-    current = None  # {"saat":..., "ucus":..., "names":[...]}
+    current_time: str | None = None
+    pending_names: List[str] = []
+    pending_flight: str | None = None
 
-    def flush():
-        nonlocal current
-        if not current:
+    def flush_pending():
+        nonlocal pending_names, pending_flight, current_time, rows
+        if not current_time:
             return
-        names = [n.strip() for n in current.get("names", []) if n.strip()]
-        # uniq preserve order
-        seen = set()
-        uniq = []
-        for n in names:
-            if n not in seen:
-                seen.add(n)
-                uniq.append(n)
-        yolcu = ", ".join(uniq) if uniq else "?"
-        rows.append({"saat": current.get("saat", "?"), "ucus": current.get("ucus", "?"), "yolcu": yolcu})
-        current = None
+        if not pending_names and not pending_flight:
+            return
 
-    for ln in filtered:
-        # Yeni iş başlangıcı: Alış saat
-        pm = PICKUP_TIME_RE.search(ln)
-        if pm:
-            flush()
-            saat = normalize_time(pm.group(2), pm.group(3))
-            current = {"saat": saat, "ucus": "?", "names": []}
+        yolcu = ", ".join([n for n in pending_names if n]) if pending_names else "?"
+        ucus = (pending_flight or "?").strip().replace(" ", "").upper() if pending_flight else "?"
+        rows.append({"saat": current_time, "ucus": ucus, "yolcu": yolcu})
+
+        pending_names = []
+        pending_flight = None
+
+    for raw_line in (raw or "").splitlines():
+        line0 = raw_line.strip()
+        if not line0:
             continue
 
-        if current is None:
-            continue  # alış saat görmeden başlamayız
+        if drop_saw and should_drop_saw(line0):
+            continue
 
-        # Uçak kod satırı
-        fm = FLIGHT_LINE_RE.search(ln.replace("İ", "I").replace("ı", "i"))
+        line = clean_line(line0)
+        if not line:
+            continue
+
+        # 1) "Alış saat: 5:50"  → yeni JOB
+        m_pick = PICKUP_LABEL_RE.search(line)
+        if m_pick:
+            flush_pending()
+            current_time = normalize_time(m_pick.group(2), m_pick.group(3))
+
+            rest = PICKUP_LABEL_RE.sub("", line).strip(" -–:")
+            rest = strip_phones(rest)
+            if rest and len(rest) > 2:
+                pending_names.append(rest)
+            continue
+
+        # 2) Satır tek başına saat ise → yeni JOB (ör: "21:00" veya "18.05")
+        m_time_only = re.fullmatch(r"\s*([01]?\d|2[0-3])[:\.]([0-5]\d)\s*", line)
+        if m_time_only:
+            flush_pending()
+            current_time = normalize_time(m_time_only.group(1), m_time_only.group(2))
+            continue
+
+        # current_time yoksa hiçbir şey toplama (saat kesinleşmeden veri alma)
+        if not current_time:
+            continue
+
+        # 3) Uçuş etiketi: "Uçak kod: TK073 ..."
+        m_flabel = FLIGHT_LABEL_RE.search(line)
+        if m_flabel:
+            pending_flight = m_flabel.group(3)
+            continue
+
+        # 4) Genel uçuş kodu
+        fm = FLIGHT_RE.search(line)
         if fm:
-            current["ucus"] = fm.group(2).replace(" ", "").upper()
-            continue
+            pending_flight = fm.group(1)
 
-        # İsim listesi satırı (ve devam satırları)
-        nm = NAME_LINE_RE.search(ln)
-        if nm:
-            tail = nm.group(2).strip()
-            tail = remove_quotes_noise(strip_phones(tail))
-            # Çin ayırıcı 、 ve / ve , ile böl
-            parts = re.split(r"[、,]+", tail)
+        # 5) İsim listesi / name satırları
+        # "İsim listesi: ..." veya "Name:" vb.
+        if re.search(r"\b(isim|name)\b", line, flags=re.I):
+            tail = re.split(r":", line, maxsplit=1)[-1].strip()
+            tail = strip_phones(tail)
+            parts = re.split(r"[、,;/]|\\n", tail)
             for p in parts:
-                p = p.strip()
-                if p:
-                    current["names"].append(p)
+                p = p.strip().strip('"').strip("'")
+                if len(p) >= 2:
+                    pending_names.append(p)
             continue
 
-        # İsim listesi bazen bir alt satıra taşar: "İsim listesi：" satırından sonra isimler tek satır gelebilir
-        # Bu yüzden, current varsa ve satır "XIE/..." gibi isim formatındaysa ekle.
-        # Adres/otel/araç tipi vs. olanları alma
-        low = ln.lower()
-        if any(k in low for k in ("otel", "araç", "arac", "transfer", "pax", "uçak", "ucak", "kodu", "can-ist", "hkg", "ist", "alış", "alis")):
+        # Numaralı isim listesi: "1. VLACHOS ... 2. ..."
+        if re.match(r"^\s*\d+\.\s*\S+", line):
+            t = re.sub(r"^\s*\d+\.\s*", "", line).strip()
+            t = strip_phones(t)
+            if len(t) >= 2:
+                pending_names.append(t)
             continue
 
-        # isim gibi duruyorsa ekle
-        candidate = remove_quotes_noise(strip_phones(ln))
-        if candidate and len(candidate) >= 2:
-            # sadece tarih ise alma
-            if re.fullmatch(r"\d{1,2}\.\d{1,2}\.\d{4}", candidate):
-                continue
-            # tamamen saatler gibi ise alma
-            if TIME_RE.fullmatch(candidate):
-                continue
-            current["names"].append(candidate)
+        # Normal isim satırı
+        candidate = strip_phones(line).strip().strip('"').strip("'")
 
-    flush()
+        # Açıklama satırlarını isim sanma
+        if re.search(r"\b(transfer|araç|arac|otel|pax|ist alış|ist alis)\b", candidate, flags=re.I):
+            continue
+        if re.fullmatch(r"[A-Z]{3}\s*-\s*[A-Z]{3}", candidate):
+            continue
+
+        if len(candidate) >= 2:
+            pending_names.append(candidate)
+
+    flush_pending()
     return rows
 
-# -----------------------------
-# Mode 2: generic time blocks (fallback)
-# -----------------------------
-def split_into_time_blocks(raw: str, drop_saw: bool) -> List[Dict[str, str]]:
-    lines = [clean_line(x) for x in (raw or "").splitlines()]
-    filtered: List[str] = []
-    for ln in lines:
-        if not ln:
-            continue
-        if NOISE_LINE_RE.search(ln):
-            continue
-        if drop_saw and should_drop_saw(ln):
-            continue
-        if is_address_line(ln):
-            continue
-        filtered.append(ln)
+def rows_to_tsv_grouped(rows: List[Dict[str, str]]) -> str:
+    """
+    Senin kurala göre:
+    - Aynı saat = 1 iş/araç
+    - Aynı saatte birden çok yolcu varsa 4. sütunda aynı hücrede virgülle
+    - (Pratikte: saat bazlı gruplayıp birleştiriyoruz)
+    - 4 sütun: Saat, boş, Uçuş, Yolcu(lar)
+    NOT: Saatte birden fazla farklı uçuş varsa -> aynı saatte farklı satır olur (mantıklı)
+    """
+    grouped: Dict[Tuple[str, str], List[str]] = {}
 
-    text = fix_mojibake("\n".join(filtered))
-    matches = list(TIME_RE.finditer(text))
-    blocks: List[Dict[str, str]] = []
-    if not matches:
-        return blocks
-
-    for i, m in enumerate(matches):
-        start = m.start()
-        end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
-        time_str = normalize_time(m.group(1), m.group(2))
-        chunk = text[start:end].strip()
-        blocks.append({"saat": time_str, "chunk": chunk})
-    return blocks
-
-def extract_flight_and_names(chunk: str) -> Dict[str, str]:
-    c = chunk
-    c = TIME_RE.sub(" ", c)
-    fm = FLIGHT_RE.search(c)
-    flight = fm.group(1).replace(" ", "").upper() if fm else "?"
-    if fm:
-        c = re.sub(re.escape(fm.group(1)), " ", c, flags=re.IGNORECASE)
-    c = strip_phones(c)
-    c = re.sub(r"\[\d{1,2}/\d{1,2}\s+\d{1,2}:\d{2}\]", " ", c)
-    c = re.sub(r"\b\d+\.\s*", " ", c)
-    c = re.sub(r"/\s*\d+\s*(yolcu|yolcular|passenger|passengers)\b", " ", c, flags=re.IGNORECASE)
-    c = remove_quotes_noise(c)
-    parts = [p.strip() for p in re.split(r"[\n,]+", c) if p.strip()]
-    cleaned: List[str] = []
-    for p in parts:
-        if len(p) < 2:
-            continue
-        if FLIGHT_RE.fullmatch(p.replace(" ", ""), re.IGNORECASE):
-            continue
-        if re.fullmatch(r"[\d\W_]+", p):
-            continue
-        cleaned.append(p)
-    seen = set()
-    uniq = []
-    for n in cleaned:
-        if n not in seen:
-            seen.add(n)
-            uniq.append(n)
-    names = ", ".join(uniq) if uniq else "?"
-    return {"ucus": flight, "yolcu": names}
-
-def to_tsv(rows: List[Dict[str, str]]) -> str:
-    out = []
     for r in rows:
-        out.append(f"{r.get('saat','?')}\t\t{r.get('ucus','?')}\t{r.get('yolcu','?')}")
-    return "\n".join(out)
+        saat = (r.get("saat") or "?").strip()
+        ucus = (r.get("ucus") or "?").strip().upper()
+        yolcu = (r.get("yolcu") or "").strip()
+
+        if not yolcu:
+            continue
+
+        # kesin telefon temizliği
+        yolcu = strip_phones(yolcu)
+
+        key = (saat, ucus)
+        grouped.setdefault(key, []).append(yolcu)
+
+    # sort by time then flight
+    def time_key(t: str) -> Tuple[int, int, str]:
+        m = TIME_RE.search(t)
+        if not m:
+            return (99, 99, t)
+        return (int(m.group(1)), int(m.group(2)), t)
+
+    items = sorted(grouped.items(), key=lambda kv: (time_key(kv[0][0]), kv[0][1]))
+
+    lines = []
+    for (saat, ucus), yolcular in items:
+        # unique preserve order
+        seen = set()
+        uniq = []
+        for y in yolcular:
+            if y not in seen:
+                seen.add(y)
+                uniq.append(y)
+
+        yolcu_cell = ", ".join(uniq)
+        lines.append(f"{saat}\t\t{ucus}\t{yolcu_cell}")
+
+    return "\n".join(lines)
 
 # -----------------------------
 # UI
 # -----------------------------
 def render_home(buffer_text: str, message: str = "", drop_saw: bool = True) -> str:
     checked = "checked" if drop_saw else ""
-    buf_len = len((buffer_text or "").strip())
+    buf_len = len(buffer_text.strip())
     return f"""<!doctype html>
 <html lang="tr">
 <head>
@@ -315,6 +311,7 @@ def render_home(buffer_text: str, message: str = "", drop_saw: bool = True) -> s
     button {{ padding:10px 14px; cursor:pointer; }}
     .hint {{ color:#444; margin:10px 0 18px; }}
     .msg {{ color:#0a6; margin:10px 0; }}
+    .warn {{ color:#b00; margin:10px 0; }}
     .small {{ font-size: 12px; color:#666; }}
     .counter {{ margin-top: 10px; font-weight: bold; }}
   </style>
@@ -323,15 +320,15 @@ def render_home(buffer_text: str, message: str = "", drop_saw: bool = True) -> s
   <div class="box">
     <h2>AI Transfer Bot</h2>
     <div class="hint">
-      WhatsApp metnini parça parça ekle → <b>Ekle</b><br/>
-      Bitince → <b>Bitti</b> → TSV üret.
+      Parça parça liste ekle → <b>Ekle (Kaydet)</b> <br/>
+      Her şey bittiğinde → <b>Bitti (Çevir)</b> ile TSV üret.
     </div>
 
     {"<div class='msg'>" + message + "</div>" if message else ""}
 
     <form method="post" action="/add">
       <label><input type="checkbox" name="drop_saw" value="1" {checked}/> SAW satırlarını çıkar</label>
-      <div class="counter">Taslak metin: {buf_len} karakter</div>
+      <div class="counter">Taslakta kayıtlı metin: {buf_len} karakter</div>
       <p class="small">Aşağıya yeni parçayı yapıştır (sadece yeni gelen kısmı). "Ekle" deyince taslağa ekler.</p>
       <textarea name="text" placeholder="Yeni parçayı buraya yapıştır..."></textarea>
       <div class="row">
@@ -352,7 +349,7 @@ def render_home(buffer_text: str, message: str = "", drop_saw: bool = True) -> s
 </body>
 </html>"""
 
-def render_result(tsv: str, count: int) -> str:
+def render_result(tsv: str, found_count: int) -> str:
     safe = (tsv or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
     return f"""<!doctype html>
 <html lang="tr">
@@ -378,7 +375,7 @@ def render_result(tsv: str, count: int) -> str:
       <a class="button" href="/download">İndir (TSV)</a>
       <a href="/" style="padding:10px 14px;">Geri dön</a>
     </div>
-    <p>Bulunan kayıt: <b>{count}</b></p>
+    <p>Bulunan kayıt: {found_count}</p>
     <p>WhatsApp / Sheets'e direkt yapıştırabilirsin.</p>
     <pre>{safe}</pre>
   </div>
@@ -398,7 +395,7 @@ def home(session_id: str | None = Cookie(default=None)):
     buf = get_buffer(sid)
     html = render_home(buf, message="", drop_saw=True)
     resp = HTMLResponse(html)
-    resp.set_cookie("session_id", sid, max_age=60*60*24*30)
+    resp.set_cookie("session_id", sid, max_age=60*60*24*30)  # 30 days
     return resp
 
 @app.post("/add", response_class=HTMLResponse)
@@ -425,26 +422,27 @@ def finish(
     sid = get_or_create_session(session_id)
     raw = get_buffer(sid)
 
-    # Önce "Alış saat:" var mı? varsa o moda geç
-    if PICKUP_TIME_RE.search(raw or ""):
-        rows = parse_pickup_style(raw, drop_saw=bool(drop_saw))
-    else:
-        blocks = split_into_time_blocks(raw, drop_saw=bool(drop_saw))
-        rows = []
-        for b in blocks:
-            info = extract_flight_and_names(b["chunk"])
-            rows.append({"saat": b["saat"], "ucus": info["ucus"], "yolcu": info["yolcu"]})
+    rows = extract_rows_from_text(raw, drop_saw=bool(drop_saw))
+    tsv = rows_to_tsv_grouped(rows)
 
-    tsv = to_tsv(rows)
-    set_last_result(sid, tsv)
+    db = _load_db()
+    sess = db["sessions"].setdefault(sid, {"buffer": raw, "updated_at": ""})
+    sess["last_result_tsv"] = tsv
+    sess["updated_at"] = datetime.utcnow().isoformat() + "Z"
+    _save_db(db)
 
-    return HTMLResponse(render_result(tsv, count=len(rows)))
+    found = len([ln for ln in tsv.splitlines() if ln.strip()]) if tsv else 0
+    return HTMLResponse(render_result(tsv, found))
 
 @app.get("/download")
 def download(session_id: str | None = Cookie(default=None)):
     sid = get_or_create_session(session_id)
-    tsv = get_last_result(sid) or ""
-    bom_tsv = "\ufeff" + tsv  # UTF-8 BOM (Sheets/Excel TR karakter için)
+    db = _load_db()
+    tsv = db.get("sessions", {}).get(sid, {}).get("last_result_tsv", "")
+
+    # UTF-8 BOM ekleyelim (Excel/Sheets TR karakteri doğru görsün)
+    bom_tsv = "\ufeff" + (tsv or "")
+
     headers = {
         "Content-Disposition": "attachment; filename=result.tsv",
         "Content-Type": "text/tab-separated-values; charset=utf-8",
@@ -459,3 +457,4 @@ def reset(session_id: str | None = Cookie(default=None)):
     resp = HTMLResponse(html)
     resp.set_cookie("session_id", sid, max_age=60*60*24*30)
     return resp
+```0
