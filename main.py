@@ -457,4 +457,3 @@ def reset(session_id: str | None = Cookie(default=None)):
     resp = HTMLResponse(html)
     resp.set_cookie("session_id", sid, max_age=60*60*24*30)
     return resp
-```0
