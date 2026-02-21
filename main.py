@@ -1,17 +1,25 @@
-import os, re, json, uuid
+import os
+import re
+import json
+import uuid
+from pathlib import Path
 from datetime import datetime
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Tuple
 
 from fastapi import FastAPI, Form, Cookie
 from fastapi.responses import HTMLResponse, PlainTextResponse
 
 app = FastAPI()
+
+# -----------------------------
+# Storage (file-based buffer to survive multiple Railway workers)
+# -----------------------------
+DATA_DIR = Path("data")
+DATA_DIR.mkdir(exist_ok=True)
+
 DB_PATH = "db.json"
 
 
-# -----------------------------
-# DB helpers
-# -----------------------------
 def _load_db() -> Dict[str, Any]:
     if not os.path.exists(DB_PATH):
         return {"sessions": {}}
@@ -27,73 +35,74 @@ def _save_db(db: Dict[str, Any]) -> None:
         json.dump(db, f, ensure_ascii=False, indent=2)
 
 
+def session_file(sid: str) -> Path:
+    return DATA_DIR / f"{sid}.txt"
+
+
 def get_or_create_session(session_id: Optional[str]) -> str:
     db = _load_db()
-    if not session_id or session_id not in db.get("sessions", {}):
+    sessions = db.setdefault("sessions", {})
+    if not session_id or session_id not in sessions:
         session_id = uuid.uuid4().hex
-        db["sessions"][session_id] = {
-            "buffer": "",
-            "updated_at": datetime.utcnow().isoformat() + "Z",
-            "last_result_tsv": ""
-        }
+        sessions[session_id] = {"updated_at": datetime.utcnow().isoformat() + "Z"}
         _save_db(db)
     return session_id
 
 
-def append_to_buffer(session_id: str, text: str) -> None:
+def get_buffer(sid: str) -> str:
+    f = session_file(sid)
+    if not f.exists():
+        return ""
+    return f.read_text(encoding="utf-8", errors="replace")
+
+
+def set_buffer(sid: str, text: str) -> None:
+    session_file(sid).write_text(text or "", encoding="utf-8")
+
+
+def append_to_buffer(sid: str, text: str) -> None:
+    if not text:
+        return
+    cur = get_buffer(sid)
+    if cur and not cur.endswith("\n"):
+        cur += "\n"
+    cur += text
+    set_buffer(sid, cur)
+
     db = _load_db()
-    s = db["sessions"].setdefault(session_id, {"buffer": "", "updated_at": "", "last_result_tsv": ""})
-    if text:
-        if s["buffer"] and not s["buffer"].endswith("\n"):
-            s["buffer"] += "\n"
-        s["buffer"] += text
-    s["updated_at"] = datetime.utcnow().isoformat() + "Z"
+    sess = db.setdefault("sessions", {}).setdefault(sid, {})
+    sess["updated_at"] = datetime.utcnow().isoformat() + "Z"
     _save_db(db)
-
-
-def set_buffer(session_id: str, text: str) -> None:
-    db = _load_db()
-    db["sessions"][session_id] = {
-        "buffer": text or "",
-        "updated_at": datetime.utcnow().isoformat() + "Z",
-        "last_result_tsv": db.get("sessions", {}).get(session_id, {}).get("last_result_tsv", "")
-    }
-    _save_db(db)
-
-
-def get_buffer(session_id: str) -> str:
-    db = _load_db()
-    return db.get("sessions", {}).get(session_id, {}).get("buffer", "")
-
-
-def set_last_result(session_id: str, tsv: str) -> None:
-    db = _load_db()
-    s = db["sessions"].setdefault(session_id, {"buffer": "", "updated_at": "", "last_result_tsv": ""})
-    s["last_result_tsv"] = tsv or ""
-    s["updated_at"] = datetime.utcnow().isoformat() + "Z"
-    _save_db(db)
-
-
-def get_last_result(session_id: str) -> str:
-    db = _load_db()
-    return db.get("sessions", {}).get(session_id, {}).get("last_result_tsv", "")
 
 
 # -----------------------------
-# Parsing / Cleaning
+# Normalization & Cleaning
 # -----------------------------
-TIME_RE = re.compile(r"\b([01]?\d|2[0-3])[:\.]([0-5]\d)\b")
-DATE_RE = re.compile(r"\b(\d{1,2}[./]\d{1,2}[./]\d{2,4}|\d{1,2}\s*(Şubat|Ocak|Mart|Nisan|Mayıs|Haziran|Temmuz|Ağustos|Eylül|Ekim|Kasım|Aralık))\b", re.IGNORECASE)
+TIME_RE = re.compile(r"(?<!\d)([01]?\d|2[0-3])[:\.]([0-5]\d)(?!\d)")
+# Standard airline-ish codes: TK1710, SU2130, BA678, GQ670, LH1300, KL1959, W95771 etc.
+FLIGHT_STD_RE = re.compile(r"\b([A-Z]{1,3}\s?\d{2,5})\b", re.IGNORECASE)
+# Misc codes like W9A5327, A4*3069
+MISC_CODE_RE = re.compile(r"\b([A-Z]\d[A-Z]\d{3,4}|\bA\d\*\d{4}\b)\b", re.IGNORECASE)
 
-# Flight codes we want:
-# TK1710, SU2130, BA678, CZ8065, W95771, A3994, etc.
-FLIGHT_RE = re.compile(r"\b([A-Z]{1,3}\d{2,5}|[A-Z]\d{1}[A-Z]\d{3,4}|[A-Z]{1,2}\d{4,5})\b", re.IGNORECASE)
+WHATSAPP_META_RE = re.compile(r"^\s*\d{1,2}/\d{1,2}\s+\d{1,2}[:\.]\d{2}\s*[^:]{1,40}:\s*")
 
-WHATSAPP_PREFIX_RE = re.compile(
-    r"^\s*\d{1,2}[./]\d{1,2}(?:[./]\d{2,4})?\s+\d{1,2}[:\.]\d{2}\s*[^:]{1,80}:\s*"
+
+MONTHS_TR = (
+    "Ocak", "Şubat", "Mart", "Nisan", "Mayıs", "Haziran",
+    "Temmuz", "Ağustos", "Eylül", "Ekim", "Kasım", "Aralık"
 )
+DATE_DOT_RE = re.compile(r"\b\d{1,2}\.\d{1,2}\.\d{4}\b")
+DATE_MONTH_RE = re.compile(r"\b\d{1,2}\s+(%s)\b" % "|".join(MONTHS_TR), re.IGNORECASE)
 
-ONLY_TIME_LINE_RE = re.compile(r"^\s*([01]?\d|2[0-3])[:\.]([0-5]\d)\s*$")
+# Address-ish keywords (TR + EN)
+ADDRESS_HINT_RE = re.compile(
+    r"\b(Mah|Mah\.|Caddesi|Cad\.|Cad|Sokak|Sk\.|Sk|No:|No\.|Daire|Kat|Blok|"
+    r"Apt|Apartman|Street|St\.|Road|Rd\.|Ave|Avenue|Boulevard|Blvd|"
+    r"Beyoğlu|Fatih|Şişli|Beşiktaş|Kadıköy|Üsküdar|Arnavutköy|İstanbul|Turkiye|Türkiye)\b",
+    re.IGNORECASE
+)
+POSTAL_TR_RE = re.compile(r"\b\d{5}\b")
+MANY_DIGITS_RE = re.compile(r"\d.*\d.*\d")  # line contains multiple digits somewhere
 
 
 def normalize_time(hh: str, mm: str) -> str:
@@ -102,307 +111,255 @@ def normalize_time(hh: str, mm: str) -> str:
 
 def fix_mojibake(s: str) -> str:
     """
-    WhatsApp/Sheets bazen UTF-8'i Latin-1 gibi gösteriyor:
-    'Åubat', 'Ãimen' vb. Bu tip bozulmaları mümkünse düzelt.
+    Fix common WhatsApp mojibake like 'Å', 'Ã¼' when UTF-8 got decoded as latin-1.
+    Safe: if it doesn't look like mojibake, returns original.
     """
     if not s:
         return s
-    # Heuristic: if looks mojibake-ish
-    if "Ã" in s or "Å" in s or "Ä" in s:
+    if ("Ã" in s) or ("Å" in s) or ("Ä" in s) or ("Ð" in s):
         try:
-            return s.encode("latin1", errors="ignore").decode("utf-8", errors="ignore")
+            return s.encode("latin-1", errors="strict").decode("utf-8", errors="strict")
         except Exception:
             return s
     return s
 
 
 def strip_phones(s: str) -> str:
-    # Remove phone-ish tokens: +90..., 10+ digits with spaces, etc.
+    # removes +90 5xx..., 05xx..., long digit sequences
     s = re.sub(r"\+?\d[\d\s\-]{7,}\d", "", s)
     s = re.sub(r"\s{2,}", " ", s).strip()
     return s
 
 
-def looks_like_address(line: str) -> bool:
-    u = line.upper()
-    if "HTTP" in u or "WWW." in u:
-        return True
-    if re.search(r"\b\d{5}\b", line):  # postal code
-        return True
-    # Address keywords (TR)
-    keywords = ["MAH", "MAHALLE", "CAD", "CADDESI", "CD.", "SOK", "SK.", "NO:", "KAT", "DAIRE", "FATIH/", "BEYOĞLU/", "İSTANBUL", "TÜRKİYE", "TURKIYE"]
-    if any(k in u for k in keywords):
-        return True
-    # Many commas often indicates full address
-    if line.count(",") >= 3:
-        return True
-    return False
-
-
-def clean_line(line: str) -> str:
-    line = fix_mojibake(line)
-    line = line.replace("\u00a0", " ").strip()
-
-    # Remove WhatsApp signature prefix
-    line = WHATSAPP_PREFIX_RE.sub("", line)
-
-    # Remove common noise
-    line = line.replace("Uçak inmiş", "").strip()
-    line = re.sub(r"\b(Yarın için|Bugün için)\b", "", line, flags=re.IGNORECASE).strip()
-
-    # Remove emoji (keep it simple)
-    line = re.sub(r"[\U0001F300-\U0001FAFF]", "", line).strip()
-
-    # Normalize multiple spaces
-    line = re.sub(r"\s{2,}", " ", line).strip()
-    return line
-
-
 def is_noise_line(line: str) -> bool:
-    if not line:
+    l = line.strip()
+    if not l:
         return True
-
-    # Dates like 16.02.2026 or "21 Şubat" -> drop (do NOT touch times)
-    if DATE_RE.search(line):
-        # but if the line is ONLY a time, keep it
-        if ONLY_TIME_LINE_RE.match(line):
-            return False
+    # WhatsApp meta like [21/2 06:48] Name:
+    if WHATSAPP_META_RE.search(l):
+        return False  # we'll strip meta but keep the remaining content
+    # status lines
+    if l.lower() in {"uçak inmiş", "ucak inmis", "ok", "tamam"}:
         return True
-
-    u = line.upper()
-
-    # Drop address lines
-    if looks_like_address(line):
+    # pure question mark / separators
+    if l in {"?", "-", "—", "–"}:
         return True
-
-    # Drop logistical lines we don't want inside "yolcu"
-    bad_starts = [
-        "ALIŞ SAAT", "ALIS SAAT", "TRANSFER", "ARAÇ", "ARAC", "OTEL",
-        "UÇAK KOD", "UCAK KOD", "UÇUŞ", "UCUS", "UÇUŞ KOD", "UCUS KOD",
-        "PAX", "IST ALIŞ", "IST ALIS"
-    ]
-    if any(u.startswith(x) for x in bad_starts):
-        # BUT: sometimes flight code is on this line too. We'll handle flight extraction separately,
-        # so we can drop it from passenger text.
-        return False
-
-    # Lines that are only separators / quotes
-    if u in {"?", "-", "—", "–", "''", '""'}:
+    # a bare day number coming from "21 Şubat" cleanup
+    if re.fullmatch(r"\d{1,2}", l):
         return True
-
+    # pure phone-ish
+    if re.fullmatch(r"\+?\d[\d\s\-]{7,}\d", l):
+        return True
     return False
 
 
-def extract_pickup_time_from_line(line: str) -> Optional[str]:
-    """
-    Return time if line indicates pickup time (or is only a time).
-    Avoid taking times inside flight range "23:15-05:50" as job time.
-    """
-    m_only = ONLY_TIME_LINE_RE.match(line)
-    if m_only:
-        return normalize_time(m_only.group(1), m_only.group(2))
+def looks_like_address(line: str) -> bool:
+    l = line.strip()
+    if not l:
+        return False
+    # if strong hints or postal code present
+    if ADDRESS_HINT_RE.search(l):
+        return True
+    if POSTAL_TR_RE.search(l) and ("istan" in l.lower() or "türk" in l.lower() or "turk" in l.lower()):
+        return True
+    # many digits + comma structure often an address
+    if l.count(",") >= 2 and MANY_DIGITS_RE.search(l):
+        return True
+    return False
 
-    # "Alış saat: 5:50"
-    m = re.search(r"(ALIŞ|ALIS)\s*SAAT[:\s]*([01]?\d|2[0-3])[:\.]([0-5]\d)", line, flags=re.IGNORECASE)
+
+def clean_line_keep_content(line: str) -> str:
+    l = fix_mojibake(line)
+
+    # Remove WhatsApp meta prefix, keep content after "Name:"
+    l = WHATSAPP_META_RE.sub("", l).strip()
+
+    # Remove dates (whole)
+    l = DATE_DOT_RE.sub("", l)
+    l = DATE_MONTH_RE.sub("", l)
+
+    # Clean leftover double spaces
+    l = re.sub(r"\s{2,}", " ", l).strip()
+    return l
+
+
+def extract_flight(text: str) -> str:
+    t = text or ""
+    m = FLIGHT_STD_RE.search(t)
     if m:
-        return normalize_time(m.group(2), m.group(3))
+        return m.group(1).replace(" ", "").upper()
+    m2 = MISC_CODE_RE.search(t)
+    if m2:
+        return m2.group(1).replace(" ", "").upper()
+    return "?"
 
-    return None
 
-
-def extract_flight_from_line(line: str) -> Optional[str]:
+def extract_names(text_lines: List[str]) -> str:
     """
-    Extract first flight-ish code.
-    Avoid grabbing things like "A4*3069" (has *).
+    Prefer explicit 'İsim listesi' lines, else use cleaned meaningful lines.
     """
-    if "*" in line:
-        # A4*3069 -> not flight code
-        line2 = line.replace("*", "")
-    else:
-        line2 = line
+    joined = "\n".join(text_lines)
 
-    fm = FLIGHT_RE.search(line2)
-    if not fm:
-        return None
-    code = fm.group(1).replace(" ", "").upper()
+    # Try explicit name list markers
+    markers = [
+        r"İsim listesi\s*[:：]\s*(.*)",
+        r"ISIM listesi\s*[:：]\s*(.*)",
+        r"İSİM LİSTESİ\s*[:：]\s*(.*)",
+        r"NAME\s*[:：]\s*(.*)",
+        r"İSİM\s*[:：]\s*(.*)",
+    ]
+    for pat in markers:
+        m = re.search(pat, joined, flags=re.IGNORECASE)
+        if m:
+            tail = m.group(1).strip()
+            tail = tail.replace("、", ",")
+            tail = re.sub(r"[\u201c\u201d\"“”]", "", tail)
+            tail = strip_phones(tail)
+            tail = re.sub(r"\s{2,}", " ", tail).strip()
+            if tail:
+                # split by comma and re-join to normalize
+                parts = [p.strip() for p in re.split(r"[,\n]+", tail) if p.strip()]
+                return ", ".join(parts)
 
-    # Exclude very short accidental matches
-    if len(code) < 4:
-        return None
+    # Numbered list like "1. NAME" "2. NAME"
+    numbered = []
+    for ln in text_lines:
+        mm = re.match(r"^\s*\d+\.\s*(.+)$", ln.strip())
+        if mm:
+            val = mm.group(1).strip()
+            val = re.sub(r"[\u201c\u201d\"“”]", "", val)
+            val = strip_phones(val)
+            if val:
+                numbered.append(val)
+    if numbered:
+        return ", ".join(numbered)
 
-    return code
+    # Fallback: keep lines that look like person names (not addresses, not flight-like, not time-only)
+    keep = []
+    for ln in text_lines:
+        x = ln.strip()
+        if not x:
+            continue
+        if looks_like_address(x):
+            continue
+        # remove flights and times from candidate
+        x2 = FLIGHT_STD_RE.sub("", x)
+        x2 = MISC_CODE_RE.sub("", x2)
+        x2 = TIME_RE.sub("", x2)
+        x2 = strip_phones(x2)
+        x2 = re.sub(r"\b(Transfer|Araç|Arac|Otel|Uçak|Ucak|Kod|pax|IST|IHL|Airport|Havalimanı)\b", "", x2, flags=re.IGNORECASE)
+        x2 = re.sub(r"\s{2,}", " ", x2).strip()
+        if len(x2) >= 2:
+            keep.append(x2)
 
+    # Remove duplicates preserve order
+    seen = set()
+    uniq = []
+    for k in keep:
+        if k not in seen:
+            seen.add(k)
+            uniq.append(k)
 
-def extract_names_from_line(line: str) -> List[str]:
-    """
-    Extract passenger names from various formats:
-    - "İsim listesi：A, B, C"  / Chinese comma "、"
-    - "1. NAME" "2. NAME"
-    - Plain "Funda Kara"
-    """
-    s = line.strip()
-
-    # If contains "İsim listesi"
-    m = re.search(r"(İSİM|ISIM)\s*LİSTESİ\s*[:：]\s*(.+)$", s, flags=re.IGNORECASE)
-    if m:
-        tail = m.group(2).strip()
-        tail = tail.replace("、", ",")
-        parts = [p.strip().strip('"').strip("'") for p in tail.split(",")]
-        return [p for p in parts if p]
-
-    # Numbered lines "1. VLACHOS SPYRIDON"
-    s = re.sub(r"^\s*\d+\.\s*", "", s).strip()
-
-    # Remove phones
-    s = strip_phones(s)
-
-    # If line still contains obvious non-name tokens, drop them
-    u = s.upper()
-    if any(k in u for k in ["OTEL:", "OTEL", "TRANSFER", "ARAÇ", "ARAC", "PAX", "IST", "ALIŞ", "ALIS", "UÇAK", "UCAK", "UÇUŞ", "UCUS"]):
-        # but line can still be a name; be conservative:
-        # if it has 2+ words and mostly letters, allow.
-        pass
-
-    # A very simple name heuristic: at least 2 letters
-    if len(re.sub(r"[^A-Za-zÇĞİÖŞÜçğıöşüÀ-ÿ\s\-']", "", s)) < 2:
-        return []
-
-    # If this is only a flight code, ignore
-    if ONLY_TIME_LINE_RE.match(s):
-        return []
-
-    if FLIGHT_RE.fullmatch(s.replace(" ", "")):
-        return []
-
-    # Clean quotes
-    s = s.strip().strip('"').strip("'").strip()
-    if not s:
-        return []
-
-    return [s]
+    return ", ".join(uniq) if uniq else "?"
 
 
+def should_drop_saw(line: str) -> bool:
+    return "SAW" in (line or "").upper()
+
+
+# -----------------------------
+# Core parsing: "time anchors" -> each time starts a new job/row
+# -----------------------------
 def parse_jobs(raw: str, drop_saw: bool) -> List[Dict[str, str]]:
-    """
-    State-machine parser.
-    We build a pending record by collecting:
-      - names
-      - flight
-      - pickup time
-    For WhatsApp format, typically: Name -> Flight -> Time
-    When we encounter a pickup time and pending has a name/flight, we finalize one job.
-    """
-    raw = fix_mojibake(raw or "")
-    lines0 = raw.splitlines()
-
-    # Pre-clean lines
+    lines_in = (raw or "").splitlines()
     lines: List[str] = []
-    saw_flag = False
-    for ln in lines0:
-        cl = clean_line(ln)
-        if not cl:
+
+    for ln in lines_in:
+        ln = clean_line_keep_content(ln)
+        if not ln:
             continue
-        if "SAW" in cl.upper():
-            saw_flag = True
-        lines.append(cl)
+        if drop_saw and should_drop_saw(ln):
+            continue
+        # remove pure noise
+        if is_noise_line(ln):
+            continue
+        # drop addresses early
+        if looks_like_address(ln):
+            continue
+        lines.append(ln)
 
-    jobs: List[Dict[str, str]] = []
-    pending_names: List[str] = []
-    pending_flight: str = "?"
-    pending_drop: bool = False
+    jobs: List[Dict[str, Any]] = []
+    current: Optional[Dict[str, Any]] = None
 
-    def finalize(time_str: str):
-        nonlocal pending_names, pending_flight, pending_drop
-        if drop_saw and pending_drop:
-            pending_names = []
-            pending_flight = "?"
-            pending_drop = False
-            return
+    def start_job(t: str):
+        nonlocal current
+        if current is not None:
+            jobs.append(current)
+        current = {"time": t, "lines": []}
 
-        # If no names, don't create a record
-        if not pending_names:
-            pending_names = []
-            pending_flight = "?"
-            pending_drop = False
-            return
-
-        # De-dup preserve order
-        seen = set()
-        uniq = []
-        for n in pending_names:
-            n2 = n.strip()
-            if not n2:
+    for ln in lines:
+        tm = TIME_RE.search(ln)
+        if tm:
+            # THIS time is the job time anchor
+            tnorm = normalize_time(tm.group(1), tm.group(2))
+            start_job(tnorm)
+            # keep rest of line content (minus the time)
+            rest = TIME_RE.sub("", ln).strip()
+            rest = rest.strip(" -–—")
+            rest = re.sub(r"\s{2,}", " ", rest).strip()
+            if rest and (not looks_like_address(rest)):
+                current["lines"].append(rest)
+        else:
+            if current is None:
+                # no time yet -> ignore (we only build rows from time anchors)
                 continue
-            if n2 not in seen:
-                seen.add(n2)
-                uniq.append(n2)
+            current["lines"].append(ln)
 
-        jobs.append({
-            "saat": time_str or "?",
-            "ucus": pending_flight or "?",
-            "yolcu": ", ".join(uniq)
-        })
+    if current is not None:
+        jobs.append(current)
 
-        pending_names = []
-        pending_flight = "?"
-        pending_drop = False
+    # build output rows (one row per job/time)
+    out: List[Dict[str, str]] = []
+    for j in jobs:
+        t = j.get("time", "?")
+        jlines = j.get("lines", [])
 
-    for cl in lines:
-        if drop_saw and "SAW" in cl.upper():
-            pending_drop = True
-            continue
+        # Remove residual date words that could appear alone
+        cleaned_lines = []
+        for x in jlines:
+            x = x.strip()
+            if not x:
+                continue
+            # remove standalone "21 Şubat" remnants safely
+            x = DATE_DOT_RE.sub("", x)
+            x = DATE_MONTH_RE.sub("", x)
+            x = re.sub(r"\s{2,}", " ", x).strip()
+            if not x or re.fullmatch(r"\d{1,2}", x):
+                continue
+            if looks_like_address(x):
+                continue
+            cleaned_lines.append(x)
 
-        # If address line, skip
-        if looks_like_address(cl):
-            continue
+        block_text = " ".join(cleaned_lines)
+        flight = extract_flight(block_text)
+        passenger = extract_names(cleaned_lines)
 
-        # Flight extraction (even if the line is otherwise "noise")
-        flight = extract_flight_from_line(cl)
-        if flight:
-            pending_flight = flight
+        out.append({"saat": t, "ucus": flight, "yolcu": passenger})
 
-        # Pickup time?
-        pickup_time = extract_pickup_time_from_line(cl)
-        if pickup_time:
-            # Finalize only if we already collected something meaningful
-            if pending_names or (pending_flight and pending_flight != "?"):
-                finalize(pickup_time)
-            else:
-                # time exists but no names/flight yet -> do nothing
-                pass
-            continue
-
-        # Drop pure date lines (do not touch other lines)
-        if DATE_RE.search(cl) and not ONLY_TIME_LINE_RE.match(cl):
-            continue
-
-        # If it's noise-like line but could contain names list, let extract_names try
-        if is_noise_line(cl):
-            # still try extract names from "İsim listesi"
-            ns = extract_names_from_line(cl)
-            if ns:
-                pending_names.extend(ns)
-            continue
-
-        # Names
-        ns = extract_names_from_line(cl)
-        if ns:
-            pending_names.extend(ns)
-
-    return jobs
+    return out
 
 
-def jobs_to_tsv(jobs: List[Dict[str, str]]) -> str:
+def rows_to_tsv(rows: List[Dict[str, str]]) -> str:
     """
-    4 columns TSV:
-    Saat, (blank), Uçuş, Yolcu
-    Do NOT auto-merge different jobs.
+    4 columns:
+    Saat \t (blank) \t Uçuş \t Yolcu
+    No grouping. One row per detected job time.
     """
     out_lines = []
-    for j in jobs:
-        saat = (j.get("saat") or "?").strip()
-        ucus = (j.get("ucus") or "?").strip().upper()
-        yolcu = (j.get("yolcu") or "?").strip()
+    for r in rows:
+        saat = (r.get("saat") or "?").strip()
+        ucus = (r.get("ucus") or "?").strip().upper()
+        yolcu = (r.get("yolcu") or "?").strip()
         out_lines.append(f"{saat}\t\t{ucus}\t{yolcu}")
     return "\n".join(out_lines)
 
@@ -412,7 +369,7 @@ def jobs_to_tsv(jobs: List[Dict[str, str]]) -> str:
 # -----------------------------
 def render_home(buffer_text: str, message: str = "", drop_saw: bool = True) -> str:
     checked = "checked" if drop_saw else ""
-    buf_len = len((buffer_text or "").strip())
+    buf_len = len(buffer_text or "")
     return f"""<!doctype html>
 <html lang="tr">
 <head>
@@ -491,7 +448,7 @@ def render_result(tsv: str, found: int) -> str:
       <a class="button" href="/download">İndir (TSV)</a>
       <a href="/" style="padding:10px 14px;">Geri dön</a>
     </div>
-    <p>Bulunan kayıt: <b>{found}</b></p>
+    <p><b>Bulunan kayıt:</b> {found}</p>
     <p>WhatsApp / Sheets'e direkt yapıştırabilirsin.</p>
     <pre>{safe}</pre>
   </div>
@@ -542,19 +499,28 @@ def finish(
     sid = get_or_create_session(session_id)
     raw = get_buffer(sid)
 
-    jobs = parse_jobs(raw, drop_saw=bool(drop_saw))
-    tsv = jobs_to_tsv(jobs)
+    rows = parse_jobs(raw, drop_saw=bool(drop_saw))
+    tsv = rows_to_tsv(rows)
 
-    set_last_result(sid, tsv)
-    return HTMLResponse(render_result(tsv, found=len(jobs)))
+    # store last result in db (small)
+    db = _load_db()
+    sess = db.setdefault("sessions", {}).setdefault(sid, {})
+    sess["last_result_tsv"] = tsv
+    sess["updated_at"] = datetime.utcnow().isoformat() + "Z"
+    _save_db(db)
+
+    return HTMLResponse(render_result(tsv, found=len(rows)))
 
 
 @app.get("/download")
 def download(session_id: Optional[str] = Cookie(default=None)):
     sid = get_or_create_session(session_id)
-    tsv = get_last_result(sid) or ""
-    # UTF-8 BOM (Excel/Sheets TR için)
-    bom_tsv = "\ufeff" + tsv
+    db = _load_db()
+    tsv = db.get("sessions", {}).get(sid, {}).get("last_result_tsv", "")
+
+    # Excel/Sheets TR için UTF-8 BOM ekleyelim
+    bom_tsv = "\ufeff" + (tsv or "")
+
     headers = {
         "Content-Disposition": "attachment; filename=result.tsv",
         "Content-Type": "text/tab-separated-values; charset=utf-8",
