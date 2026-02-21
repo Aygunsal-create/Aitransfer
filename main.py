@@ -289,3 +289,19 @@ def temizle():
     return {"ok": True, "cleared": True}
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8080)
+from fastapi.responses import HTMLResponse
+
+@app.get("/", response_class=HTMLResponse)
+def home():
+    return """
+    <html>
+        <head>
+            <title>AI Transfer</title>
+        </head>
+        <body style="font-family: Arial; text-align:center; margin-top:60px;">
+            <h1>AI Transfer Hazır 🚐</h1>
+            <p>Liste yüklemek için /upload sayfasını kullan.</p>
+            <a href="/upload">Liste Yükle</a>
+        </body>
+    </html>
+    """
