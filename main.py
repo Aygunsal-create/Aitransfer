@@ -1,398 +1,461 @@
-from fastapi import FastAPI, Request, Form
+import os, re, json, uuid
+from datetime import datetime
+from typing import Dict, Any, List, Tuple
+
+from fastapi import FastAPI, Form, Cookie
 from fastapi.responses import HTMLResponse, PlainTextResponse, Response
-import re, os, json, uuid
-from typing import List, Dict, Optional, Tuple
 
 app = FastAPI()
 DB_PATH = "db.json"
 
-# -----------------------
-# Storage
-# -----------------------
-
-def _read_db() -> Dict[str, List[Dict[str, str]]]:
+# -----------------------------
+# DB helpers (very simple)
+# -----------------------------
+def _load_db() -> Dict[str, Any]:
     if not os.path.exists(DB_PATH):
-        return {}
+        return {"sessions": {}}
     try:
         with open(DB_PATH, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        if isinstance(data, dict):
-            return data
+            return json.load(f)
     except Exception:
-        pass
-    return {}
+        return {"sessions": {}}
 
-def _write_db(data: Dict[str, List[Dict[str, str]]]) -> None:
-    tmp = DB_PATH + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, DB_PATH)
+def _save_db(db: Dict[str, Any]) -> None:
+    with open(DB_PATH, "w", encoding="utf-8") as f:
+        json.dump(db, f, ensure_ascii=False, indent=2)
 
-def get_session_id(request: Request, sid_form: Optional[str] = None) -> str:
-    # 1) Form/URL’den gelen sid (cookie yoksa da çalışsın)
-    if sid_form and isinstance(sid_form, str) and 10 <= len(sid_form) <= 80:
-        return sid_form.strip()
+def get_or_create_session(session_id: str | None) -> str:
+    db = _load_db()
+    if not session_id or session_id not in db.get("sessions", {}):
+        session_id = uuid.uuid4().hex
+        db["sessions"][session_id] = {
+            "buffer": "",
+            "updated_at": datetime.utcnow().isoformat() + "Z",
+            "last_result_tsv": ""
+        }
+        _save_db(db)
+    return session_id
 
-    # 2) Cookie
-    sid_cookie = request.cookies.get("sid")
-    if sid_cookie and isinstance(sid_cookie, str) and 10 <= len(sid_cookie) <= 80:
-        return sid_cookie
+def append_to_buffer(session_id: str, text: str) -> None:
+    db = _load_db()
+    s = db["sessions"].setdefault(session_id, {"buffer": "", "updated_at": "", "last_result_tsv": ""})
+    if text:
+        if s["buffer"] and not s["buffer"].endswith("\n"):
+            s["buffer"] += "\n"
+        s["buffer"] += text
+    s["updated_at"] = datetime.utcnow().isoformat() + "Z"
+    _save_db(db)
 
-    # 3) Yeni oluştur
-    return str(uuid.uuid4())
+def set_buffer(session_id: str, text: str) -> None:
+    db = _load_db()
+    db["sessions"][session_id] = {
+        "buffer": text or "",
+        "updated_at": datetime.utcnow().isoformat() + "Z",
+        "last_result_tsv": db.get("sessions", {}).get(session_id, {}).get("last_result_tsv", "")
+    }
+    _save_db(db)
 
-def get_rows(sid: str) -> List[Dict[str, str]]:
-    db = _read_db()
-    rows = db.get(sid, [])
-    return rows if isinstance(rows, list) else []
+def get_buffer(session_id: str) -> str:
+    db = _load_db()
+    return db.get("sessions", {}).get(session_id, {}).get("buffer", "")
 
-def set_rows(sid: str, rows: List[Dict[str, str]]) -> None:
-    db = _read_db()
-    db[sid] = rows
-    _write_db(db)
+# -----------------------------
+# WhatsApp / Turkish cleanup
+# -----------------------------
 
-def append_rows(sid: str, new_rows: List[Dict[str, str]]) -> None:
-    rows = get_rows(sid)
-    rows.extend(new_rows)
-    set_rows(sid, rows)
+# [21/2 17:10] gibi prefix
+WA_BRACKET = re.compile(r"^\s*\[\d{1,2}/\d{1,2}.*?\]\s*")
 
-# -----------------------
-# Text cleanup (WhatsApp)
-# -----------------------
+# "Eyüp Abi BDR:" gibi gönderici
+WA_SENDER = re.compile(r"^\s*[^:\n]{1,60}:\s*")
 
-WA_BRACKET = re.compile(r'^\s*\[\d{1,2}/\d{1,2}.*?\]\s*')  # [21/2 ...]
-WA_SENDER  = re.compile(r'^\s*[^:\n]{1,50}:\s*')          # Eyüp Abi BDR: ...
-NAME_LINE  = re.compile(r'^\s*(name|isim)\s*:\s*', re.I)
-PHONE_LINE = re.compile(r'^\s*(phone|telefon)\s*(number|no)?\s*:\s*', re.I)
-URL_LINE   = re.compile(r'https?://\S+', re.I)
+# Name/Phone satırları
+NAME_LINE = re.compile(r"^\s*(name|isim)\s*:\s*", re.I)
+PHONE_LINE = re.compile(r"^\s*(phone|telefon)\s*(number|no)?\s*:\s*", re.I)
+
+# URL / maps
+URL_RE = re.compile(r"https?://\S+|www\.\S+", re.I)
+
+ADDRESS_KEYWORDS = [
+    # TR / İstanbul / Türkiye
+    "TÜRKİYE", "TURKIYE", "TR", "ISTANBUL", "İSTANBUL",
+    # adres kısaltmaları
+    "MAH", "MAH.", "MAHALLE", "CAD", "CAD.", "CADDESİ", "CADDESI",
+    "SOK", "SOK.", "SK", "SK.", "SOKAK",
+    "NO:", "NO", "NUMARA", "APT", "APARTMAN", "KAT", "DAIRE", "DAİRE",
+    "BLOK", "POSTA", "KODU", "ZIP", "ZIPCODE",
+    # otel / lokasyon
+    "HOTEL", "HOTELS", "SUITES", "RESIDENCE", "APART", "APARTMENT",
+    "MARRIOTT", "RADISSON", "HILTON", "HYATT", "INTERCONTINENTAL", "IHG",
+    # harita
+    "MAPS", "GOOGLE", "WAZE"
+]
 
 def fix_mojibake(s: str) -> str:
-    # EyÃ¼p -> Eyüp gibi bozulmayı toparlar
-    try:
-        b = s.encode("latin-1", "ignore")
-        u = b.decode("utf-8", "ignore")
-        if "Ã" in s and ("Ã" not in u):
-            return u
-    except Exception:
-        pass
+    """
+    WhatsApp kopyasında sık görülen bozulmayı düzeltir:
+    EyÃ¼p -> Eyüp, Ä°stanbul -> İstanbul, JiÅ™i -> Jiři vb.
+    """
+    if not s:
+        return s
+    # sadece belirti varsa dene
+    if ("Ã" in s) or ("Ä" in s) or ("Å" in s) or ("Ð" in s):
+        try:
+            return s.encode("latin-1", "ignore").decode("utf-8", "ignore")
+        except Exception:
+            return s
+    return s
+
+def looks_like_address(line: str) -> bool:
+    """
+    Adresleri silmek için heuristik:
+    - çok fazla virgül / rakam
+    - adres anahtar kelimeleri
+    - uzun ve lokasyon ağırlıklı satırlar
+    """
+    if not line:
+        return False
+
+    up = line.upper().replace("İ", "I")
+    # keyword
+    for kw in ADDRESS_KEYWORDS:
+        if kw in up:
+            return True
+
+    # çok virgül + uzunluk adres ihtimali
+    comma_count = line.count(",")
+    digit_count = sum(ch.isdigit() for ch in line)
+
+    if comma_count >= 3 and len(line) >= 35:
+        return True
+    if digit_count >= 8 and len(line) >= 25:
+        return True
+
+    # "Mah Refik Saydam Cad" gibi kelime paterni
+    if re.search(r"\b(MAH|CAD|SK|SOK)\b", up):
+        return True
+
+    return False
+
+def clean_whatsapp_line(line: str) -> str:
+    s = fix_mojibake(line).strip()
+    if not s:
+        return ""
+
+    # URL sil
+    s = URL_RE.sub("", s).strip()
+    if not s:
+        return ""
+
+    # [21/2 ...] sil
+    s = WA_BRACKET.sub("", s).strip()
+
+    # Name/Phone satırlarını direkt yok say
+    if NAME_LINE.match(s) or PHONE_LINE.match(s):
+        return ""
+
+    # Gönderen adını sil: "Eyüp Abi BDR: ..."
+    s = WA_SENDER.sub("", s).strip()
+
+    # fazla boşlukları toparla
+    s = re.sub(r"\s{2,}", " ", s).strip()
+
     return s
 
 def clean_whatsapp_text(raw: str) -> str:
-    raw = fix_mojibake(raw)
+    raw = fix_mojibake(raw or "")
     raw = raw.replace("\r\n", "\n").replace("\r", "\n")
-    cleaned: List[str] = []
-
-    for line in raw.split("\n"):
-        s = line.strip()
-        if not s:
-            continue
-
-        s = URL_LINE.sub("", s).strip()
-        if not s:
-            continue
-
-        s = WA_BRACKET.sub("", s).strip()
-
-        if NAME_LINE.match(s) or PHONE_LINE.match(s):
-            continue
-
-        s = WA_SENDER.sub("", s).strip()
-
-        s = s.replace("•", " ").replace("  ", " ").strip()
-        if not s:
-            continue
-
-        cleaned.append(s)
-
-    return "\n".join(cleaned)
-
-# -----------------------
-# Parsing logic (time -> rows)
-# -----------------------
-
-TIME_RE = re.compile(r'\b(\d{1,2})[:.](\d{2})\b')
-
-def norm_time(h: str, m: str) -> str:
-    try:
-        hh = int(h); mm = int(m)
-        if 0 <= hh <= 23 and 0 <= mm <= 59:
-            return f"{hh:02d}:{mm:02d}"
-    except Exception:
-        pass
-    return "?"
-
-def split_into_time_blocks(text: str) -> List[Tuple[str, str]]:
-    """
-    Saat kaç kere geçiyorsa o kadar satır.
-    Aynı saat olsa bile birleştirme YOK.
-    """
-    lines = text.split("\n")
-    blocks: List[Tuple[str, List[str]]] = []
-    current_time: Optional[str] = None
-    current_lines: List[str] = []
-
-    def flush():
-        nonlocal current_time, current_lines
-        if current_time is not None:
-            blocks.append((current_time, current_lines[:]))
-        current_time = None
-        current_lines = []
-
-    for line in lines:
-        m = TIME_RE.search(line)
-        if m:
-            flush()
-            current_time = norm_time(m.group(1), m.group(2))
-            current_lines.append(line)
-        else:
-            if current_time is None:
-                continue
-            current_lines.append(line)
-
-    flush()
-    return [(t, "\n".join(ls).strip()) for t, ls in blocks]
-
-FLIGHT_RE = re.compile(r'\b([A-Z]{1,3}\s?\d{1,4}[A-Z]?)\b')
-PHONE_RE  = re.compile(r'\+?\d[\d\s\-()]{6,}\d')
-PASS_RE   = re.compile(r'\b(\d+)\s*(yolcu|passengers?)\b', re.I)
-
-def normalize_flight(token: str) -> str:
-    return token.strip().replace(" ", "").upper().strip(".,;:()[]{}")
-
-def extract_flight(block: str) -> str:
-    cands = [normalize_flight(x) for x in FLIGHT_RE.findall(block)]
-    return cands[0] if cands else "?"
-
-BAD_WORDS = {
-    "TR", "TÜRKİYE", "TURKIYE", "ISTANBUL", "İSTANBUL",
-    "MAH", "MAH.", "CAD", "CAD.", "SK", "SK.", "NO", "NO:",
-    "HOTEL", "HOTELS", "TRANSFER", "RADISSON", "MARRIOTT",
-    "SUITES", "GARDEN", "INTERCONTINENTAL"
-}
-
-def extract_passenger_note(block: str) -> str:
-    m = PASS_RE.search(block)
-    return f"/ {m.group(1)} Yolcu" if m else ""
-
-def extract_names(block: str) -> str:
-    s = PHONE_RE.sub(" ", block)
-    s = re.sub(r'\[.*?\]', ' ', s)
-    s = TIME_RE.sub(" ", s)
-
-    for tok in set(FLIGHT_RE.findall(s)):
-        s = s.replace(tok, " ")
-
-    parts = re.split(r'[,;\n]+', s)
     out: List[str] = []
-    seen = set()
-
-    for p in parts:
-        p = re.sub(r'\s+', ' ', p).strip().strip('"').strip("'")
-        if not p:
+    for line in raw.split("\n"):
+        s = clean_whatsapp_line(line)
+        if not s:
             continue
-
-        if len(re.findall(r'\d', p)) >= 4:
+        # adres satırıysa komple at
+        if looks_like_address(s):
             continue
+        out.append(s)
+    return "\n".join(out)
 
-        up = p.upper().replace("İ", "I")
-        words = [w for w in re.split(r'\s+', up) if w]
-        if any(w in BAD_WORDS for w in words):
-            continue
+# -----------------------------
+# Parsing / Rules
+# -----------------------------
+TIME_RE = re.compile(r"\b([01]?\d|2[0-3])[:\.]([0-5]\d)\b")
+FLIGHT_RE = re.compile(r"\b([A-Z]{1,3}\s?\d{2,5})\b", re.IGNORECASE)
 
-        if len(re.findall(r'[A-Za-zÀ-ÖØ-öø-ÿĞğİıŞşÇçÜüÖö]', p)) < 2:
-            continue
+def normalize_time(hh: str, mm: str) -> str:
+    return f"{int(hh):02d}:{int(mm):02d}"
 
-        key = p.lower()
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append(p)
+def strip_phones(s: str) -> str:
+    # +90 5xx xxx xx xx / 05xx... / 10+ digits etc.
+    s = re.sub(r"\+?\d[\d\s\-\(\)]{7,}\d", "", s)
+    s = re.sub(r"\s{2,}", " ", s).strip()
+    return s
 
-    return ", ".join(out) if out else "?"
+def should_drop_saw(line: str) -> bool:
+    return "SAW" in line.upper()
 
-def build_rows_from_text(raw_text: str, remove_saw: bool) -> List[Dict[str, str]]:
-    cleaned = clean_whatsapp_text(raw_text or "")
-    blocks = split_into_time_blocks(cleaned)
-
+def extract_rows_from_text(raw: str, drop_saw: bool) -> List[Dict[str, str]]:
+    """
+    Toleranslı parser + WhatsApp temizliği + adres silme.
+    """
+    cleaned = clean_whatsapp_text(raw or "")
     rows: List[Dict[str, str]] = []
-    for t, block in blocks:
-        if remove_saw and "SAW" in block.upper():
+    last_time = None
+
+    for line in cleaned.splitlines():
+        l = line.strip()
+        if not l:
             continue
-        flight = extract_flight(block)
-        note = extract_passenger_note(block)
-        names = extract_names(block)
-        yolcu = (names + (" " + note if note else "")).strip()
-        rows.append({"saat": t or "?", "ucus": flight or "?", "yolcu": yolcu or "?"})
+        if drop_saw and should_drop_saw(l):
+            continue
+
+        # adres gibi görünüyorsa zaten temizlemede atıldı; ama ekstra güvenlik:
+        if looks_like_address(l):
+            continue
+
+        # time
+        tm = TIME_RE.search(l)
+        if tm:
+            last_time = normalize_time(tm.group(1), tm.group(2))
+
+        # flight
+        fm = FLIGHT_RE.search(l)
+        flight = fm.group(1).replace(" ", "").upper() if fm else "?"
+
+        # passenger/name: remove known tokens
+        l2 = TIME_RE.sub("", l)
+        if fm:
+            l2 = re.sub(re.escape(fm.group(1)), "", l2, flags=re.IGNORECASE)
+
+        l2 = re.sub(r"\b(IHL|IST|AIRPORT|HAVALIMANI|ARRIVAL|DEPARTURE)\b", "", l2, flags=re.IGNORECASE)
+        l2 = re.sub(r"/\s*\d+\s*(YOLCU|YOLCULAR|PASSENGER|PASSENGERS)\b", "", l2, flags=re.IGNORECASE)
+
+        name = strip_phones(l2)
+        name = re.sub(r"^\s*(Name|İsim)\s*:\s*", "", name, flags=re.IGNORECASE).strip()
+        name = name.strip(" ,.-—|")
+
+        # yine adres gibi kaldıysa at
+        if looks_like_address(name):
+            continue
+
+        if not name or len(name) < 2:
+            continue
+
+        rows.append({
+            "saat": last_time or "?",
+            "ucus": flight or "?",
+            "yolcu": name
+        })
+
     return rows
 
-# -----------------------
-# TSV output
-# -----------------------
+def rows_to_tsv_grouped(rows: List[Dict[str, str]]) -> str:
+    """
+    Senin iş akışına uygun:
+    - Aynı saat + aynı uçuş => tek satır, yolcular virgülle
+    - 4 sütun: Saat, boş, Uçuş, Yolcu(lar)
+    """
+    grouped: Dict[Tuple[str, str], List[str]] = {}
 
-def rows_to_tsv(rows: List[Dict[str, str]]) -> str:
-    lines = ["Saat\t\tUçuş\tYolcu"]
     for r in rows:
-        lines.append(f"{r.get('saat','?')}\t\t{r.get('ucus','?')}\t{r.get('yolcu','?')}")
+        saat = (r.get("saat") or "?").strip()
+        ucus = (r.get("ucus") or "?").strip().upper()
+        yolcu = (r.get("yolcu") or "").strip()
+
+        if not yolcu:
+            continue
+
+        yolcu = strip_phones(yolcu)
+        if looks_like_address(yolcu):
+            continue
+
+        key = (saat, ucus)
+        grouped.setdefault(key, []).append(yolcu)
+
+    def time_key(t: str) -> Tuple[int, int, str]:
+        m = TIME_RE.search(t)
+        if not m:
+            return (99, 99, t)
+        return (int(m.group(1)), int(m.group(2)), t)
+
+    items = sorted(grouped.items(), key=lambda kv: (time_key(kv[0][0]), kv[0][1]))
+
+    lines = []
+    for (saat, ucus), yolcular in items:
+        seen = set()
+        uniq = []
+        for y in yolcular:
+            if y not in seen:
+                seen.add(y)
+                uniq.append(y)
+        yolcu_cell = ", ".join(uniq)
+        lines.append(f"{saat}\t\t{ucus}\t{yolcu_cell}")
+
     return "\n".join(lines)
 
-# -----------------------
+# -----------------------------
 # UI
-# -----------------------
-
-def page_html(sid: str, message: str = "", result: str = "", count: int = 0, remove_saw_checked: bool = True) -> str:
-    msg_html = f"<div class='msg'>{message}</div>" if message else ""
-    checked = "checked" if remove_saw_checked else ""
-    result_html = ""
-    if result:
-        result_html = f"""
-        <div class="card">
-          <h3>Sonuç (TSV)</h3>
-          <div class="hint">WhatsApp/Sheets’e direkt yapıştırabilirsin.</div>
-          <textarea readonly class="out">{result}</textarea>
-          <div class="row">
-            <a class="btn" href="/download?sid={sid}">İndir (TSV)</a>
-            <form method="post" action="/reset" style="display:inline;">
-              <input type="hidden" name="sid" value="{sid}">
-              <button class="btn danger" type="submit">Sıfırla</button>
-            </form>
-          </div>
-        </div>
-        """
-
-    return f"""
-<!doctype html>
+# -----------------------------
+def render_home(buffer_text: str, message: str = "", drop_saw: bool = True) -> str:
+    checked = "checked" if drop_saw else ""
+    buf_len = len(buffer_text.strip())
+    return f"""<!doctype html>
 <html lang="tr">
 <head>
-<meta charset="utf-8"/>
-<meta name="viewport" content="width=device-width, initial-scale=1"/>
-<title>AI Transfer Bot</title>
-<style>
-  body {{ font-family: Arial, sans-serif; margin: 18px; }}
-  .title {{ font-size: 20px; font-weight: 700; margin-bottom: 6px; }}
-  .sub {{ color:#444; margin-bottom: 10px; }}
-  .card {{ border:1px solid #ddd; border-radius: 10px; padding: 12px; margin-top: 12px; }}
-  textarea {{ width:100%; min-height: 180px; font-family: ui-monospace, Menlo, Consolas, monospace; }}
-  .out {{ min-height: 220px; }}
-  .row {{ display:flex; gap:10px; flex-wrap:wrap; margin-top:10px; align-items:center; }}
-  .btn {{ display:inline-block; padding:10px 12px; border-radius:10px; border:1px solid #333; background:#fff; cursor:pointer; text-decoration:none; color:#111; }}
-  .btn.primary {{ background:#111; color:#fff; border-color:#111; }}
-  .btn.danger {{ background:#b00020; color:#fff; border-color:#b00020; }}
-  .hint {{ color:#666; font-size: 12px; margin: 6px 0; }}
-  .msg {{ padding:10px 12px; border-radius:10px; background:#f3f3f3; margin: 10px 0; }}
-  label {{ user-select:none; }}
-</style>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>AI Transfer Bot</title>
+  <style>
+    body {{ font-family: Arial, sans-serif; margin: 24px; }}
+    .box {{ max-width: 900px; }}
+    textarea {{ width: 100%; height: 220px; }}
+    .row {{ display:flex; gap:12px; flex-wrap: wrap; margin-top:12px; }}
+    button {{ padding:10px 14px; cursor:pointer; }}
+    .hint {{ color:#444; margin:10px 0 18px; }}
+    .msg {{ color:#0a6; margin:10px 0; }}
+    .small {{ font-size: 12px; color:#666; }}
+    .counter {{ margin-top: 10px; font-weight: bold; }}
+  </style>
 </head>
 <body>
-  <div class="title">AI Transfer Bot</div>
-  <div class="sub">Parça parça yapıştır → <b>Ekle</b> ile kaydet → en sonunda <b>Bitir</b> ile tek çıktı al.</div>
+  <div class="box">
+    <h2>AI Transfer Bot</h2>
+    <div class="hint">
+      Parça parça liste ekle → <b>Ekle (Kaydet)</b> <br/>
+      Her şey bittiğinde → <b>Bitti (Çevir)</b> ile TSV üret.
+    </div>
 
-  {msg_html}
+    {"<div class='msg'>" + message + "</div>" if message else ""}
 
-  <div class="card">
-    <form method="post" action="/action">
-      <input type="hidden" name="sid" value="{sid}">
-      <label>
-        <input type="checkbox" name="remove_saw" value="1" {checked}>
-        SAW satırlarını çıkar
-      </label>
-      <div class="hint">WhatsApp kopya formatındaki “[21/2] …”, “Gönderen:” vb. otomatik temizlenir.</div>
-      <textarea name="text" placeholder="Listeyi buraya yapıştır..."></textarea>
-
+    <form method="post" action="/add">
+      <label><input type="checkbox" name="drop_saw" value="1" {checked}/> SAW satırlarını çıkar</label>
+      <div class="counter">Taslakta kayıtlı metin: {buf_len} karakter</div>
+      <p class="small">Aşağıya yeni parçayı yapıştır (sadece yeni gelen kısmı). "Ekle" deyince taslağa ekler.</p>
+      <textarea name="text" placeholder="Yeni parçayı buraya yapıştır..."></textarea>
       <div class="row">
-        <button class="btn primary" type="submit" name="do" value="append">Ekle (Kaydet)</button>
-        <button class="btn" type="submit" name="do" value="finish">Bitir (Çıktı üret)</button>
-        <a class="btn" href="/download?sid={sid}">İndir (TSV)</a>
+        <button type="submit">Ekle (Kaydet)</button>
       </div>
-
-      <div class="hint">Kayıtlı satır: <b>{count}</b></div>
     </form>
 
-    <form method="post" action="/reset" style="margin-top:10px;">
-      <input type="hidden" name="sid" value="{sid}">
-      <button class="btn danger" type="submit">Sıfırla</button>
+    <form method="post" action="/finish" style="margin-top:14px;">
+      <input type="hidden" name="drop_saw" value="{1 if drop_saw else 0}">
+      <div class="row">
+        <button type="submit">Bitti (Çevir)</button>
+        <button type="submit" formaction="/reset" style="background:#eee;">Sıfırla</button>
+      </div>
     </form>
+
+    <p class="small" style="margin-top:18px;">Test: <a href="/health">/health</a></p>
   </div>
-
-  {result_html}
-
-  <div class="hint">Test: <a href="/health">/health</a></div>
 </body>
-</html>
-"""
+</html>"""
+
+def render_result(tsv: str) -> str:
+    safe = (tsv or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    return f"""<!doctype html>
+<html lang="tr">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Sonuç (TSV)</title>
+  <style>
+    body {{ font-family: Arial, sans-serif; margin: 24px; }}
+    .box {{ max-width: 900px; }}
+    pre {{ white-space: pre; overflow-x:auto; background:#f7f7f7; padding:12px; }}
+    .row {{ display:flex; gap:12px; flex-wrap: wrap; margin-top:12px; }}
+    a.button {{
+      display:inline-block; padding:10px 14px; background:#6c2bd9; color:#fff;
+      text-decoration:none; border-radius:6px;
+    }}
+  </style>
+</head>
+<body>
+  <div class="box">
+    <h3>Sonuç (TSV)</h3>
+    <div class="row">
+      <a class="button" href="/download">İndir (TSV)</a>
+      <a href="/" style="padding:10px 14px;">Geri dön</a>
+    </div>
+    <p>WhatsApp / Sheets'e direkt yapıştırabilirsin.</p>
+    <pre>{safe}</pre>
+  </div>
+</body>
+</html>"""
+
+# -----------------------------
+# Routes
+# -----------------------------
+@app.get("/health")
+def health():
+    return {"ok": True}
 
 @app.get("/", response_class=HTMLResponse)
-def home(request: Request):
-    sid = get_session_id(request)
-    rows = get_rows(sid)
-    html = page_html(sid=sid, count=len(rows))
+def home(session_id: str | None = Cookie(default=None)):
+    sid = get_or_create_session(session_id)
+    buf = get_buffer(sid)
+    html = render_home(buf, message="", drop_saw=True)
     resp = HTMLResponse(html)
-    # cookie çalışırsa iyi, çalışmazsa zaten URL sid ile gidecek
-    resp.set_cookie("sid", sid, httponly=True, samesite="lax")
+    resp.set_cookie("session_id", sid, max_age=60*60*24*30, samesite="lax")
     return resp
 
-@app.post("/action", response_class=HTMLResponse)
-def action(request: Request,
-           sid: str = Form(""),
-           do: str = Form("append"),
-           text: str = Form(""),
-           remove_saw: Optional[str] = Form(None)):
-    sid = get_session_id(request, sid_form=sid)
-    remove = bool(remove_saw)
-    existing = get_rows(sid)
+@app.post("/add", response_class=HTMLResponse)
+def add_piece(
+    text: str = Form(default=""),
+    drop_saw: str | None = Form(default=None),
+    session_id: str | None = Cookie(default=None),
+):
+    sid = get_or_create_session(session_id)
 
-    if do == "append":
-        new_rows = build_rows_from_text(text, remove_saw=remove)
-        if not new_rows:
-            html = page_html(sid=sid, message="⚠️ Saat (HH:MM) bulunamadı. Metinde saat var mı kontrol et.", count=len(existing), remove_saw_checked=remove)
-            resp = HTMLResponse(html)
-            resp.set_cookie("sid", sid, httponly=True, samesite="lax")
-            return resp
+    # ham ekliyoruz (temizliği finish'te zaten yapıyoruz) ama istersen burada da temizleyebilirsin:
+    append_to_buffer(sid, (text or "").strip())
 
-        append_rows(sid, new_rows)
-        rows = get_rows(sid)
-        html = page_html(sid=sid, message=f"✅ {len(new_rows)} satır eklendi. Toplam: {len(rows)}", count=len(rows), remove_saw_checked=remove)
-        resp = HTMLResponse(html)
-        resp.set_cookie("sid", sid, httponly=True, samesite="lax")
-        return resp
-
-    # finish
-    rows = get_rows(sid)
-    if not rows:
-        html = page_html(sid=sid, message="⚠️ Kayıtlı satır yok. Önce Ekle (Kaydet) yap.", count=0, remove_saw_checked=remove)
-        resp = HTMLResponse(html)
-        resp.set_cookie("sid", sid, httponly=True, samesite="lax")
-        return resp
-
-    tsv = rows_to_tsv(rows)
-    html = page_html(sid=sid, message="✅ Bitti. Çıktı hazır.", result=tsv, count=len(rows), remove_saw_checked=remove)
+    buf = get_buffer(sid)
+    drop = bool(drop_saw)
+    msg = "Kaydedildi. Yeni parça ekleyebilirsin."
+    html = render_home(buf, message=msg, drop_saw=drop)
     resp = HTMLResponse(html)
-    resp.set_cookie("sid", sid, httponly=True, samesite="lax")
+    resp.set_cookie("session_id", sid, max_age=60*60*24*30, samesite="lax")
     return resp
+
+@app.post("/finish", response_class=HTMLResponse)
+def finish(
+    drop_saw: int = Form(default=1),
+    session_id: str | None = Cookie(default=None),
+):
+    sid = get_or_create_session(session_id)
+    raw = get_buffer(sid)
+
+    rows = extract_rows_from_text(raw, drop_saw=bool(drop_saw))
+    tsv = rows_to_tsv_grouped(rows)
+
+    db = _load_db()
+    sess = db["sessions"].setdefault(sid, {"buffer": raw, "updated_at": "", "last_result_tsv": ""})
+    sess["last_result_tsv"] = tsv
+    sess["updated_at"] = datetime.utcnow().isoformat() + "Z"
+    _save_db(db)
+
+    return HTMLResponse(render_result(tsv))
 
 @app.get("/download")
-def download(request: Request, sid: str = ""):
-    sid = get_session_id(request, sid_form=sid)
-    rows = get_rows(sid)
-    tsv = rows_to_tsv(rows)
+def download(session_id: str | None = Cookie(default=None)):
+    sid = get_or_create_session(session_id)
+    db = _load_db()
+    tsv = db.get("sessions", {}).get(sid, {}).get("last_result_tsv", "") or ""
 
-    data = ("\ufeff" + tsv).encode("utf-8")  # UTF-8 BOM
+    # Türkçe karakterler için BOM (Excel/Sheets daha sorunsuz açar)
+    data = ("\ufeff" + tsv).encode("utf-8")
+
     headers = {
-        "Content-Disposition": 'attachment; filename="transfer.tsv"',
-        "Content-Type": "text/tab-separated-values; charset=utf-8"
+        "Content-Disposition": "attachment; filename=result.tsv",
+        "Content-Type": "text/tab-separated-values; charset=utf-8",
     }
-    resp = Response(content=data, headers=headers)
-    resp.set_cookie("sid", sid, httponly=True, samesite="lax")
-    return resp
+    return Response(content=data, headers=headers)
 
 @app.post("/reset", response_class=HTMLResponse)
-def reset(request: Request, sid: str = Form("")):
-    sid = get_session_id(request, sid_form=sid)
-    set_rows(sid, [])
-    html = page_html(sid=sid, message="🧹 Sıfırlandı. Yeni liste ekleyebilirsin.", count=0)
+def reset(session_id: str | None = Cookie(default=None)):
+    sid = get_or_create_session(session_id)
+    set_buffer(sid, "")
+    html = render_home("", message="Taslak sıfırlandı.", drop_saw=True)
     resp = HTMLResponse(html)
-    resp.set_cookie("sid", sid, httponly=True, samesite="lax")
+    resp.set_cookie("session_id", sid, max_age=60*60*24*30, samesite="lax")
     return resp
-
-@app.get("/health", response_class=PlainTextResponse)
-def health():
-    return "ok"
