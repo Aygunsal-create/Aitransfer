@@ -73,51 +73,36 @@ def get_last_result(session_id: str) -> str:
 
 
 # -----------------------------
-# Parsing / cleaning
+# PARSE FIRST (DO NOT BREAK TIMES)
 # -----------------------------
-TIME_RE = re.compile(r"\b([01]?\d|2[0-3])[:\.]([0-5]\d)\b")
+TIME_RE = re.compile(r"\b([01]?\d|2[0-3])[:\.]([0-5]\d)\b")  # 18:05 or 18.05
 FLIGHT_RE = re.compile(r"\b([A-Z]{1,3}\s?\d{2,5})\b", re.IGNORECASE)
 
 PHONE_RE = re.compile(r"\+?\d[\d\s\-\(\)]{7,}\d")
-WA_HDR_RE = re.compile(r"^\s*\[\s*\d{1,2}\/\d{1,2}\s+\d{1,2}[:\.]\d{2}\s*\]\s*", re.UNICODE)
+WA_TS_RE = re.compile(r"^\s*\[\s*\d{1,2}\/\d{1,2}\s+\d{1,2}[:\.]\d{2}\s*\]\s*")  # [21/2 06:48]
 
-MONTH_WORDS_RE = re.compile(
-    r"\b(şubat|subat|Åubat|ocak|mart|nisan|mayıs|mayis|haziran|temmuz|ağustos|agustos|"
-    r"eylül|eylul|ekim|kasım|kasim|aralık|aralik|"
-    r"january|february|march|april|may|june|july|august|september|october|november|december|"
-    r"jan|feb|mar|apr|jun|jul|aug|sep|oct|nov|dec)\b",
+# Tarihi "kalıp halinde" sil (gün tek başına kalmasın!)
+DATE_PHRASE_RE = re.compile(
+    r"\b(\d{1,2})\s*(Şubat|Subat|Ocak|Mart|Nisan|Mayıs|Mayis|Haziran|Temmuz|Ağustos|Agustos|Eylül|Eylul|Ekim|Kasım|Kasim|Aralık|Aralik|"
+    r"JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC|"
+    r"January|February|March|April|May|June|July|August|September|October|November|December)\b",
     re.IGNORECASE
 )
+DATE_LABEL_RE = re.compile(r"\b(Date|Tarih)\s*:\s*.*$", re.IGNORECASE)
 
-# adres ipuçları (satır içinden de temizleyeceğiz)
-ADDRESS_WORDS_RE = re.compile(
+ADDRESS_HINT_RE = re.compile(
     r"\b(mah|mahalle|cad|caddesi|cd\.?|sok|sokak|sk\.?|no[:\.]?|apt|apartman|kat|daire|"
     r"istanbul|türkiye|turkiye|beyoğlu|beyoglu|fatih|şişli|sisli|beşiktaş|besiktas|"
-    r"arnavutköy|arnavutkoy|karaköy|karakoy|"
-    r"street|st\.|road|rd\.|avenue|ave\.|boulevard|blvd\.|"
-    r"hotel|hotels|otel|residence|suite|suites)\b",
+    r"street|st\.|road|rd\.|avenue|ave\.|boulevard|blvd\.|hotel|hotels|otel|residence|suite|suites|"
+    r"\b\d{5}\b|/\s*istanbul\b|/\s*türkiye\b|/\s*turkiye\b)\b",
     re.IGNORECASE
 )
-
-POSTAL_RE = re.compile(r"\b\d{5}\b")
-SLASH_LOC_RE = re.compile(r"/\s*(istanbul|türkiye|turkiye)\b", re.IGNORECASE)
-JUST_SHORT_NUMBER_RE = re.compile(r"^\s*\d{1,2}\s*$")
-
-def fix_mojibake(s: str) -> str:
-    if not s:
-        return s
-    if any(ch in s for ch in ["Ã", "Å", "Ä", "Ð", "Þ", "�"]):
-        try:
-            return s.encode("latin1", errors="ignore").decode("utf-8", errors="ignore")
-        except Exception:
-            return s
-    return s
 
 def normalize_time_token(token: str) -> Optional[str]:
     m = TIME_RE.search(token or "")
     if not m:
         return None
-    # only normalize separator '.' -> ':', keep digits
+    # only normalize '.' -> ':' and pad hour, keep digits
     return f"{int(m.group(1)):02d}:{m.group(2)}"
 
 def strip_phones(s: str) -> str:
@@ -125,140 +110,151 @@ def strip_phones(s: str) -> str:
     s = re.sub(r"\s{2,}", " ", s).strip()
     return s
 
-def remove_whatsapp_sender(line: str) -> str:
+def remove_whatsapp_sender_safely(line: str) -> str:
     """
-    'Eyüp Abi BDR: Funda Kara' -> 'Funda Kara'
-    But do NOT touch '11:50'
+    WhatsApp: '[21/2 06:48] Eyüp Abi BDR: Funda Kara' -> 'Funda Kara'
+    IMPORTANT: Do NOT remove "11:50" because that's not a sender label.
+    Rule: Only remove sender if line originally had WhatsApp timestamp OR starts with a sender-ish text then ':' then space.
     """
-    if ":" not in line:
-        return line
-    left, right = line.split(":", 1)
-    if re.search(r"[A-Za-zÇĞİÖŞÜçğıöşü]{2,}", left):
-        # looks like sender label
-        return right.strip()
+    original = line.strip()
+
+    # remove leading [.. ..]
+    line = WA_TS_RE.sub("", original).strip()
+
+    # If remaining has "NAME: ..." pattern, remove only if left side has letters (not time)
+    if ":" in line:
+        left, right = line.split(":", 1)
+        # left side must contain at least 2 letters and NOT be a time like 11:50
+        if re.search(r"[A-Za-zÇĞİÖŞÜçğıöşü]{2,}", left) and not TIME_RE.search(left):
+            return right.strip()
+
     return line
 
-def clean_passenger_text(s: str) -> str:
-    s = fix_mojibake(s or "")
+def clean_passenger_text_only(s: str) -> str:
+    """
+    Only applied to passenger/name field AFTER time/flight are already decided.
+    Removes: phones, date phrases, address-y fragments.
+    Does NOT do any risky "remove all small numbers" stuff.
+    """
+    s = (s or "").strip()
+    if not s:
+        return ""
+
     s = strip_phones(s)
+    s = DATE_LABEL_RE.sub("", s)
+    s = DATE_PHRASE_RE.sub(" ", s)   # removes "21 Şubat" together
+    s = re.sub(r"\s{2,}", " ", s).strip()
 
-    # remove months / dates words
-    s = MONTH_WORDS_RE.sub(" ", s)
+    # If passenger text contains address-ish junk, drop those words/fragments
+    # but keep remaining name.
+    parts = []
+    for chunk in re.split(r"[,\|]", s):
+        c = chunk.strip()
+        if not c:
+            continue
+        if ADDRESS_HINT_RE.search(c) and len(c) > 18:
+            continue
+        parts.append(c)
 
-    # remove address-ish fragments (inside the passenger text)
-    s = POSTAL_RE.sub(" ", s)
-    s = SLASH_LOC_RE.sub(" ", s)
-    s = ADDRESS_WORDS_RE.sub(" ", s)
-
-    # remove leftover punctuation-heavy parts
-    s = re.sub(r"[|]+", " ", s)
+    s = ", ".join(parts).strip()
     s = re.sub(r"\s{2,}", " ", s).strip(' "\t')
 
-    # if only small number (like '21') -> drop
-    if JUST_SHORT_NUMBER_RE.match(s):
-        return ""
-    return s.strip()
-
-def clean_line(raw_line: str) -> str:
-    l = (raw_line or "").strip()
-    if not l:
-        return ""
-    l = fix_mojibake(l)
-    l = WA_HDR_RE.sub("", l)
-    l = remove_whatsapp_sender(l)
-    l = strip_phones(l)
-    l = re.sub(r"\s{2,}", " ", l).strip()
-    return l
+    return s
 
 def parse_records(raw: str) -> List[Dict[str, str]]:
     """
-    No merging. Each time we have a completed (time+flight+name) we emit ONE row.
-    Supports:
-    - WhatsApp: name line, flight line, time line
-    - Table: phone time flight name
-    - Multi-line names in quotes
+    NO MERGE.
+    Record closes only when we have both time + flight + some name.
+    We ALWAYS read time/flight first; cleaning happens after.
     """
     rows: List[Dict[str, str]] = []
 
     cur_time: Optional[str] = None
     cur_flight: Optional[str] = None
-    cur_name_parts: List[str] = []
+    cur_names: List[str] = []
 
-    def flush():
-        nonlocal cur_time, cur_flight, cur_name_parts
-        name = clean_passenger_text(" ".join(cur_name_parts).strip())
+    def flush_if_complete():
+        nonlocal cur_time, cur_flight, cur_names
+        name = clean_passenger_text_only(" ".join(cur_names).strip())
         if cur_time and cur_flight and name:
             rows.append({"saat": cur_time, "ucus": cur_flight, "yolcu": name})
-        cur_time, cur_flight, cur_name_parts = None, None, []
+            cur_time, cur_flight, cur_names = None, None, []
+            return True
+        return False
 
     for raw_line in (raw or "").splitlines():
-        l = clean_line(raw_line)
-        if not l:
+        line = raw_line.strip()
+        if not line:
             continue
 
-        # find time/flight in this line
-        tm = TIME_RE.search(l)
-        fm = FLIGHT_RE.search(l)
+        # Remove WhatsApp prefix/sender WITHOUT touching times
+        line = remove_whatsapp_sender_safely(line)
+        line = strip_phones(line)
+        line = re.sub(r"\s{2,}", " ", line).strip()
+
+        if not line:
+            continue
+
+        # 1) READ TIME/FLIGHT FIRST (from current line)
+        tm = TIME_RE.search(line)
+        fm = FLIGHT_RE.search(line)
 
         found_time = normalize_time_token(tm.group(0)) if tm else None
         found_flight = fm.group(1).replace(" ", "").upper() if fm else None
 
-        # remove time/flight from name candidate
-        name_candidate = l
+        # Build a "name candidate" by removing time/flight tokens only
+        name_candidate = line
         if tm:
             name_candidate = TIME_RE.sub(" ", name_candidate)
         if fm:
             name_candidate = re.sub(re.escape(fm.group(1)), " ", name_candidate, flags=re.IGNORECASE)
-        name_candidate = re.sub(r"\b(Name|İsim)\s*:\s*", " ", name_candidate, flags=re.IGNORECASE)
-        name_candidate = name_candidate.strip()
-        name_candidate = clean_passenger_text(name_candidate)
+        name_candidate = re.sub(r"\b(Name|İsim)\s*:\s*", " ", name_candidate, flags=re.IGNORECASE).strip()
 
-        # If we see time+flight together => new record starts, flush old first
+        # If this line is clearly an address line AND has no time/flight, skip it
+        if not found_time and not found_flight and ADDRESS_HINT_RE.search(name_candidate) and len(name_candidate) > 25:
+            continue
+
+        # 2) STATE MACHINE (no merging)
         if found_time and found_flight:
-            flush()
+            # new record start => flush previous if complete, then start fresh
+            flush_if_complete()
             cur_time = found_time
             cur_flight = found_flight
             if name_candidate:
-                cur_name_parts.append(name_candidate)
+                cur_names.append(name_candidate)
+            flush_if_complete()
             continue
 
-        # If only flight
         if found_flight and not found_time:
-            # if an unfinished record already has both time and flight and name -> flush before starting new
-            if cur_time and cur_flight and cur_name_parts:
-                flush()
+            # set flight for current pending record
             cur_flight = found_flight
             if name_candidate:
-                cur_name_parts.append(name_candidate)
+                cur_names.append(name_candidate)
+            flush_if_complete()
             continue
 
-        # If only time
         if found_time and not found_flight:
             cur_time = found_time
-            # if we now have time+flight+name -> flush
-            if cur_time and cur_flight and cur_name_parts:
-                flush()
+            if name_candidate:
+                cur_names.append(name_candidate)
+            flush_if_complete()
             continue
 
-        # plain name/continuation
+        # no time/flight -> treat as name continuation
         if name_candidate:
-            cur_name_parts.append(name_candidate)
-            # if we already have time+flight and enough name, keep waiting for time line? (no)
-            # do nothing
+            cur_names.append(name_candidate)
+            flush_if_complete()
 
-    # final flush (if complete)
-    flush()
+    # final
+    flush_if_complete()
     return rows
 
 def to_tsv(rows: List[Dict[str, str]]) -> str:
-    # IMPORTANT: NO MERGE. 1 row per record.
     lines = ["Saat\t\tUçuş\tYolcu"]
     for r in rows:
-        saat = (r.get("saat") or "?").strip()
-        ucus = (r.get("ucus") or "?").strip().upper()
-        yolcu = (r.get("yolcu") or "?").strip()
-        lines.append(f"{saat}\t\t{ucus}\t{yolcu}")
+        lines.append(f"{r.get('saat','?')}\t\t{r.get('ucus','?')}\t{r.get('yolcu','?')}")
     return "\n".join(lines)
+
 
 # -----------------------------
 # UI
@@ -325,9 +321,6 @@ def render_result(tsv: str, found: int) -> str:
 </body>
 </html>"""
 
-# -----------------------------
-# Routes
-# -----------------------------
 @app.get("/health")
 def health():
     return {"ok": True}
