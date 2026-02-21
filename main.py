@@ -75,19 +75,22 @@ def get_last_result(session_id: str) -> str:
 # -----------------------------
 # Parsing (Hour/Row Rule)
 # -----------------------------
-# Job time: 11:50 or 18.05 (we normalize '.' -> ':', but never change digits)
+# Job time: 11:50 or 18.05 (normalize '.' -> ':', digits unchanged)
 JOB_TIME_RE = re.compile(r"\b([01]?\d|2[0-3])[:\.]([0-5]\d)\b")
 
-# WhatsApp header: [21/2 06:48] Name:
-WA_HEADER_RE = re.compile(r"^\s*\[\s*\d{1,2}\/\d{1,2}\s+\d{1,2}[:\.]\d{2}\s*\]\s*[^:]{0,80}:\s*", re.UNICODE)
+# WhatsApp header: [21/2 06:48] Eyüp Abi BDR:
+WA_HEADER_RE = re.compile(
+    r"^\s*\[\s*\d{1,2}\/\d{1,2}\s+\d{1,2}[:\.]\d{2}\s*\]\s*[^:]{0,80}:\s*",
+    re.UNICODE
+)
 
-# sender label: "Eyüp Abi: Funda Kara" (but NOT "11:50")
-SENDER_RE = re.compile(r"^\s*([A-Za-zÇĞİÖŞÜçğıöşü0-9 _-]{2,80})\s*:\s*(.+)$")
+# sender label: "Eyüp Abi BDR: Funda Kara"
+SENDER_RE = re.compile(r"^\s*([^:]{1,80})\s*:\s*(.+)$", re.UNICODE)
 
 FLIGHT_RE = re.compile(r"\b([A-Z]{1,3}\s?\d{2,5})\b", re.IGNORECASE)
 PHONE_RE = re.compile(r"\+?\d[\d\s\-\(\)]{7,}\d")
 
-# Remove full date phrases so "21" doesn't remain alone
+# Remove full date phrases so "21" doesn't remain alone: "21 Şubat", "21 FEB", etc.
 DATE_PHRASE_RE = re.compile(
     r"\b\d{1,2}\s*(Şubat|Subat|Ocak|Mart|Nisan|Mayıs|Mayis|Haziran|Temmuz|Ağustos|Agustos|Eylül|Eylul|Ekim|Kasım|Kasim|Aralık|Aralik|"
     r"JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC|"
@@ -95,10 +98,13 @@ DATE_PHRASE_RE = re.compile(
     re.IGNORECASE
 )
 
+# Address hints (we skip address lines and remove addressy chunks from passenger)
 ADDRESS_HINT_RE = re.compile(
     r"\b(mah|mahalle|cad|caddesi|cd\.?|sok|sokak|sk\.?|no[:\.]?|apt|apartman|kat|daire|"
     r"istanbul|türkiye|turkiye|beyoğlu|beyoglu|fatih|şişli|sisli|beşiktaş|besiktas|"
-    r"street|st\.|road|rd\.|avenue|ave\.|boulevard|blvd\.|hotel|hotels|otel|residence|suite|suites|"
+    r"arnavutköy|arnavutkoy|karaköy|karakoy|"
+    r"street|st\.|road|rd\.|avenue|ave\.|boulevard|blvd\.|"
+    r"hotel|hotels|otel|residence|suite|suites|"
     r"\d{5}\b|/\s*istanbul\b|/\s*türkiye\b|/\s*turkiye\b)\b",
     re.IGNORECASE
 )
@@ -115,63 +121,71 @@ def strip_phones(s: str) -> str:
     return s
 
 def clean_line(raw_line: str) -> str:
+    """
+    CRITICAL:
+    - Remove WhatsApp header fully
+    - Remove sender only if LEFT side has letters (so "15:20" never gets damaged)
+    - Do NOT alter job times
+    """
     l = (raw_line or "").strip()
     if not l:
         return ""
 
-    # Remove WhatsApp header completely (its time is NOT a job time)
+    # remove WhatsApp header (includes sender)
     l = WA_HEADER_RE.sub("", l).strip()
 
-    # Remove sender label safely (don't touch times)
+    # sender cleanup ONLY if left side contains letters
     m = SENDER_RE.match(l)
     if m:
-        left = m.group(1)
-        right = m.group(2).strip()
-        # if left side looks like a time, do NOT treat as sender
-        if not JOB_TIME_RE.search(left):
+        left = (m.group(1) or "").strip()
+        right = (m.group(2) or "").strip()
+
+        # If left has at least 2 letters, it's a sender label -> drop it.
+        # If left is numeric/time-like (e.g. "15"), DO NOT TOUCH.
+        if re.search(r"[A-Za-zÇĞİÖŞÜçğıöşü]{2,}", left) and not JOB_TIME_RE.search(left):
             l = right
 
-    # Remove phones
     l = strip_phones(l)
-
-    # Remove full date phrases
     l = DATE_PHRASE_RE.sub(" ", l)
-
-    # Cleanup spaces
     l = re.sub(r"\s{2,}", " ", l).strip()
     return l
 
-def clean_passenger(name: str) -> str:
-    name = strip_phones(name or "")
-    name = DATE_PHRASE_RE.sub(" ", name)
-    # drop address-like chunks but keep the name part
-    # if the whole thing is addressy, it will become empty and we fallback to '?'
-    if ADDRESS_HINT_RE.search(name) and len(name) > 25:
-        # try keep only first part before comma
-        name = name.split(",")[0].strip()
-        # if still addressy, empty
-        if ADDRESS_HINT_RE.search(name) and len(name) > 20:
-            name = ""
-    name = re.sub(r"\s{2,}", " ", name).strip(' "\t')
-    return name
+def clean_passenger(text: str) -> str:
+    t = strip_phones(text or "")
+    t = DATE_PHRASE_RE.sub(" ", t)
+    t = re.sub(r"\s{2,}", " ", t).strip()
+
+    # drop address-y long chunks
+    if ADDRESS_HINT_RE.search(t) and len(t) > 25:
+        # keep only first piece before comma, often name is first
+        t2 = t.split(",")[0].strip()
+        if not (ADDRESS_HINT_RE.search(t2) and len(t2) > 20):
+            t = t2
+        else:
+            t = ""
+
+    t = re.sub(r"\s{2,}", " ", t).strip(' "\t')
+    return t
 
 def parse_records_hour_row(raw: str) -> List[Dict[str, str]]:
     """
-    HARD RULE: each JOB time occurrence => one output row.
-    We collect text between job-times as the passenger block.
-    We also take the last flight code seen in that block.
+    HARD RULE:
+    Each job-time occurrence => one output row.
+    We collect content since previous time as passenger text.
+    Flight is last flight seen in that block.
     """
     rows: List[Dict[str, str]] = []
-    block_lines: List[str] = []
+
+    block_parts: List[str] = []
     last_flight: Optional[str] = None
 
-    def flush_with_time(job_time: str):
-        nonlocal block_lines, last_flight
-        passenger_raw = " ".join(block_lines).strip()
+    def flush(job_time: str):
+        nonlocal block_parts, last_flight
+        passenger_raw = " ".join(block_parts).strip()
         passenger = clean_passenger(passenger_raw) or "?"
         flight = (last_flight or "?").replace(" ", "").upper()
         rows.append({"saat": job_time, "ucus": flight, "yolcu": passenger})
-        block_lines = []
+        block_parts = []
         last_flight = None
 
     for raw_line in (raw or "").splitlines():
@@ -179,38 +193,36 @@ def parse_records_hour_row(raw: str) -> List[Dict[str, str]]:
         if not line:
             continue
 
-        # If line itself is an address line, ignore it (doesn't contribute)
+        # Ignore address-only lines if they don't contain a job time
         if ADDRESS_HINT_RE.search(line) and len(line) > 25 and not JOB_TIME_RE.search(line):
             continue
 
-        # find flight in this line (store for this block)
+        # detect flight (store for this block)
         fm = FLIGHT_RE.search(line)
         if fm:
             last_flight = fm.group(1)
 
-        # find job time: if exists => flush row NOW (hour/row)
+        # detect job time => output row immediately
         tm = JOB_TIME_RE.search(line)
         if tm:
             job_time = normalize_time_token(tm.group(0))
-            # remove time from line and keep rest as name content (if any)
+            # remove time token from remainder, and also remove flight token from remainder
             rest = JOB_TIME_RE.sub(" ", line).strip()
-            # also remove flight token from rest so it doesn't enter passenger
             if fm:
                 rest = re.sub(re.escape(fm.group(1)), " ", rest, flags=re.IGNORECASE).strip()
             if rest:
-                block_lines.append(rest)
+                block_parts.append(rest)
             if job_time:
-                flush_with_time(job_time)
+                flush(job_time)
             continue
 
-        # no job time -> keep as passenger content (but remove standalone flight-only lines)
-        # If line is only flight code, skip adding as passenger text
+        # no job time => add to passenger pool (but skip pure flight-only line)
         if fm and re.sub(re.escape(fm.group(1)), "", line, flags=re.IGNORECASE).strip() == "":
             continue
 
-        block_lines.append(line)
+        block_parts.append(line)
 
-    # Do not auto-flush without a job time (hour/row rule)
+    # Do NOT flush without a job time
     return rows
 
 def to_tsv(rows: List[Dict[str, str]]) -> str:
