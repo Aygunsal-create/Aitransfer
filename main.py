@@ -1,3 +1,10 @@
+from flask import Flask, request
+
+app = Flask(__name__)
+
+@app.route("/")
+def home():
+    return "AI Transfer Bot Calisiyor"
 from fastapi import FastAPI, Form
 from fastapi.responses import HTMLResponse, PlainTextResponse, Response, JSONResponse
 import json, os, re
@@ -280,3 +287,5 @@ def tablo_temizle():
 def temizle():
     save_db([])
     return {"ok": True, "cleared": True}
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=8080)
